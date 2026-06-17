@@ -4246,50 +4246,49 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 let ceil_requested = pool_opts
                     .map(|o| o.output_shape_rounding.eq_ignore_ascii_case("ceil"))
                     .unwrap_or(false);
-                let ceil_edge_dropped = if ceil_requested
-                    && kernel_shape.is_some()
-                    && strides.len() == 2
-                    && pads.len() == 4
-                {
-                    let input_operand = graph.operand(input_id);
-                    let input_shape = input_operand
-                        .map(|o| o.descriptor.static_or_max_shape())
-                        .unwrap_or_default();
-                    if input_shape.len() == 4 {
-                        let (input_h, input_w) = if layout == "nhwc" {
-                            (input_shape[1] as i64, input_shape[2] as i64)
-                        } else {
-                            (input_shape[2] as i64, input_shape[3] as i64)
-                        };
-                        let k = kernel_shape.as_ref().unwrap();
-                        let kh = k[0];
-                        let kw = k[1];
-                        let dh = dilations.get(0).copied().unwrap_or(1);
-                        let dw = dilations.get(1).copied().unwrap_or(1);
-                        let sh = strides[0];
-                        let sw = strides[1];
-                        let (pad_top, pad_left, pad_bottom, pad_right) =
-                            (pads[0], pads[1], pads[2], pads[3]);
-                        let h_dropped = super::pool2d_shared::onnx_ceil_drops_edge_window(
-                            input_h, kh, sh, pad_top, pad_bottom, dh,
-                        );
-                        let w_dropped = super::pool2d_shared::onnx_ceil_drops_edge_window(
-                            input_w, kw, sw, pad_left, pad_right, dw,
-                        );
-                        if h_dropped || w_dropped {
-                            let ceil_h = super::pool2d_shared::webnn_ceil_output_size(
+                let ceil_edge_dropped = if ceil_requested && strides.len() == 2 && pads.len() == 4 {
+                    if let Some(k) = kernel_shape.as_ref() {
+                        let input_operand = graph.operand(input_id);
+                        let input_shape = input_operand
+                            .map(|o| o.descriptor.static_or_max_shape())
+                            .unwrap_or_default();
+                        if input_shape.len() == 4 {
+                            let (input_h, input_w) = if layout == "nhwc" {
+                                (input_shape[1] as i64, input_shape[2] as i64)
+                            } else {
+                                (input_shape[2] as i64, input_shape[3] as i64)
+                            };
+                            let kh = k[0];
+                            let kw = k[1];
+                            let dh = dilations.first().copied().unwrap_or(1);
+                            let dw = dilations.get(1).copied().unwrap_or(1);
+                            let sh = strides[0];
+                            let sw = strides[1];
+                            let (pad_top, pad_left, pad_bottom, pad_right) =
+                                (pads[0], pads[1], pads[2], pads[3]);
+                            let h_dropped = super::pool2d_shared::onnx_ceil_drops_edge_window(
                                 input_h, kh, sh, pad_top, pad_bottom, dh,
                             );
-                            let floor_h = super::pool2d_shared::webnn_floor_output_size(
-                                input_h, kh, sh, pad_top, pad_bottom, dh,
-                            );
-                            let ceil_w = super::pool2d_shared::webnn_ceil_output_size(
+                            let w_dropped = super::pool2d_shared::onnx_ceil_drops_edge_window(
                                 input_w, kw, sw, pad_left, pad_right, dw,
                             );
-                            let floor_w = super::pool2d_shared::webnn_floor_output_size(
-                                input_w, kw, sw, pad_left, pad_right, dw,
-                            );
-                            Some((ceil_h - floor_h, ceil_w - floor_w))
+                            if h_dropped || w_dropped {
+                                let ceil_h = super::pool2d_shared::webnn_ceil_output_size(
+                                    input_h, kh, sh, pad_top, pad_bottom, dh,
+                                );
+                                let floor_h = super::pool2d_shared::webnn_floor_output_size(
+                                    input_h, kh, sh, pad_top, pad_bottom, dh,
+                                );
+                                let ceil_w = super::pool2d_shared::webnn_ceil_output_size(
+                                    input_w, kw, sw, pad_left, pad_right, dw,
+                                );
+                                let floor_w = super::pool2d_shared::webnn_floor_output_size(
+                                    input_w, kw, sw, pad_left, pad_right, dw,
+                                );
+                                Some((ceil_h - floor_h, ceil_w - floor_w))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -6532,7 +6531,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         (0..4).map(|k| format!("{}_w_{}", op_name, k)).collect();
                     nodes.push(NodeProto {
                         input: vec![w_t_name, split_sizes_name.clone()],
-                        output: w_names.iter().cloned().collect(),
+                        output: w_names.to_vec(),
                         name: format!("{}_split_w", op_name),
                         op_type: "Split".to_string(),
                         attribute: vec![AttributeProto {
@@ -6549,7 +6548,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         (0..4).map(|k| format!("{}_r_{}", op_name, k)).collect();
                     nodes.push(NodeProto {
                         input: vec![r_t_name, split_sizes_name.clone()],
-                        output: r_names.iter().cloned().collect(),
+                        output: r_names.to_vec(),
                         name: format!("{}_split_r", op_name),
                         op_type: "Split".to_string(),
                         attribute: vec![AttributeProto {
@@ -6566,7 +6565,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         (0..4).map(|k| format!("{}_b_{}", op_name, k)).collect();
                     nodes.push(NodeProto {
                         input: vec![bias_name, split_sizes_name.clone()],
-                        output: b_names.iter().cloned().collect(),
+                        output: b_names.to_vec(),
                         name: format!("{}_split_b", op_name),
                         op_type: "Split".to_string(),
                         attribute: vec![],
@@ -6578,7 +6577,7 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         (0..4).map(|k| format!("{}_rb_{}", op_name, k)).collect();
                     nodes.push(NodeProto {
                         input: vec![recurrent_bias_name.clone(), split_sizes_name.clone()],
-                        output: rb_names.iter().cloned().collect(),
+                        output: rb_names.to_vec(),
                         name: format!("{}_split_rb", op_name),
                         op_type: "Split".to_string(),
                         attribute: vec![],
@@ -6649,14 +6648,14 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         int64_data: vec![h, h, h],
                         ..Default::default()
                     });
-                    let p_names = vec![
+                    let p_names = [
                         format!("{}_pi", op_name),
                         format!("{}_po", op_name),
                         format!("{}_pf", op_name),
                     ];
                     nodes.push(NodeProto {
                         input: vec![peephole_name, p_split_sizes],
-                        output: p_names.iter().cloned().collect(),
+                        output: p_names.to_vec(),
                         name: format!("{}_split_p", op_name),
                         op_type: "Split".to_string(),
                         attribute: vec![],
@@ -10898,13 +10897,10 @@ mod tests {
             ],
             input_operands: vec![0],
             output_operands: vec![1],
-            operations: vec![{
-                let operator = Operation::Identity {
-                    input: 0,
-                    options: None,
-                    outputs: vec![1],
-                };
-                operator
+            operations: vec![Operation::Identity {
+                input: 0,
+                options: None,
+                outputs: vec![1],
             }],
             constant_operand_ids_to_handles: HashMap::new(),
             id_to_constant_tensor_operand_map: HashMap::new(),
