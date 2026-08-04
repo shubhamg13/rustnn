@@ -2796,7 +2796,6 @@ dependencies = [
  "half",
  "image",
  "insta",
- "libloading 0.9.0",
  "libtest-mimic",
  "litert",
  "litert-sys",
