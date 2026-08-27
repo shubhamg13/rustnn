@@ -34,7 +34,7 @@ onnx-runtime = ["ort", "ndarray"]
 trtx-runtime = ["trtx", "cudarc", "zstd-cache-compression"]
 trtx-runtime-mock = ["trtx/mock", "cudarc"]
 litert-runtime = ["litert", "litert-sys", "dep:flatbuffers"]
-cann-runtime = []
+cann-runtime = ["dep:hiai-rs"]
 cann-runtime-mock = []
 zstd-cache-compression = ["dep:zstd"]
 # test feature for validation of RTX runtime
@@ -66,6 +66,7 @@ litert = { version = "0.2.1", optional = true }
 litert-sys = { version = "0.2.1", optional = true }
 flatbuffers = { version = "25.12", optional = true }
 regex = "1.11"
+hiai-rs = { path = "../hiai-rs/hiai-rs", optional = true }
 webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main" }
 webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
 
@@ -87,7 +88,6 @@ objc = { version = "0.2", optional = true, features = ["exception"] }
 prost-build = "0.12"
 cc = "1.0"
 seahash = "4.1.0"
-bindgen = "0.72"
 
 [dev-dependencies]
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
