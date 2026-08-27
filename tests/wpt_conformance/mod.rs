@@ -51,6 +51,11 @@ pub fn should_skip_test_by_ops(
             "operation '{operation}' not supported by litert backend"
         ));
     }
+    if backend_prefix == "cann" && rustnn::backends::cann::op_unsupported(operation) {
+        return Some(format!(
+            "operation '{operation}' not supported by cann backend"
+        ));
+    }
     None
 }
 
@@ -80,6 +85,13 @@ pub fn should_skip_test_by_dtype(
             }
             if rustnn::backends::litert::dtype_unsupported_for_op(dt, operation) {
                 return Some(format!("dtype '{dt}' not supported by litert backend"));
+            }
+        }
+        if backend_prefix == "cann" {
+            // The CANN/HiAI NPU executes fp16 (RealDiv/Reciprocal ~2^-9 relative
+            // error); restrict to float32 inputs/outputs for deterministic results.
+            if !dt.eq_ignore_ascii_case("float32") {
+                return Some(format!("dtype '{dt}' not supported by cann backend"));
             }
         }
     }

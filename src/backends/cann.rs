@@ -31,6 +31,40 @@ use crate::operator_enums::MLOperandDataType;
 #[cfg(feature = "cann-runtime")]
 use hiai_rs::{TensorDesc, dispatch};
 
+/// WebNN operations supported by the CANN backend (the YoloV8s priority
+/// subset). Names are the raw WPT camelCase operation names. Keep in sync with
+/// `converters::cann::is_supported_op`.
+const CANN_SUPPORTED_OPS: &[&str] = &[
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "conv2d",
+    "maxPool2d",
+    "concat",
+    "reshape",
+    "resample2d",
+    "sigmoid",
+    "slice",
+    "softmax",
+    "split",
+    "transpose",
+    "cast",
+    "reduceSum",
+    "prelu",
+];
+
+/// Returns the list of WebNN operations supported by this backend (raw WPT
+/// camelCase names).
+pub fn supported_ops() -> &'static [&'static str] {
+    CANN_SUPPORTED_OPS
+}
+
+/// Returns true if `op` (raw WPT camelCase name) is not supported.
+pub fn op_unsupported(op: &str) -> bool {
+    !CANN_SUPPORTED_OPS.contains(&op)
+}
+
 /// Map WebNN operand data type to CANN adapter enum
 #[cfg(feature = "cann-runtime")]
 fn ml_operand_to_cann_dtype(data_type: MLOperandDataType) -> i32 {
