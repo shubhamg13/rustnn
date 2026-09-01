@@ -31,38 +31,15 @@ use crate::operator_enums::MLOperandDataType;
 #[cfg(feature = "cann-runtime")]
 use hiai_rs::{TensorDesc, dispatch};
 
-/// WebNN operations supported by the CANN backend (the YoloV8s priority
-/// subset). Names are the raw WPT camelCase operation names. Keep in sync with
-/// `converters::cann::is_supported_op`.
-const CANN_SUPPORTED_OPS: &[&str] = &[
-    "add",
-    "sub",
-    "mul",
-    "div",
-    "conv2d",
-    "maxPool2d",
-    "concat",
-    "reshape",
-    "resample2d",
-    "sigmoid",
-    "slice",
-    "softmax",
-    "split",
-    "transpose",
-    "cast",
-    "reduceSum",
-    "prelu",
-];
+/// WebNN operations the CANN backend cannot express at all. RNN ops are the
+/// only remaining gap (matching `converters::cann::is_unsupported_op`); every
+/// other op is wired or decomposed by the converter.
+const CANN_UNSUPPORTED_OPS: &[&str] = &["gru", "gruCell", "lstm", "lstmCell"];
 
-/// Returns the list of WebNN operations supported by this backend (raw WPT
+/// Returns the list of WebNN operations not supported by this backend (raw WPT
 /// camelCase names).
-pub fn supported_ops() -> &'static [&'static str] {
-    CANN_SUPPORTED_OPS
-}
-
-/// Returns true if `op` (raw WPT camelCase name) is not supported.
-pub fn op_unsupported(op: &str) -> bool {
-    !CANN_SUPPORTED_OPS.contains(&op)
+pub fn unsupported_ops() -> &'static [&'static str] {
+    CANN_UNSUPPORTED_OPS
 }
 
 /// Map WebNN operand data type to CANN adapter enum

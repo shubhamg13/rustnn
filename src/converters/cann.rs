@@ -72,6 +72,7 @@ pub(crate) fn webnn_op_to_hiai(op: &Operation) -> Option<&'static str> {
         Operation::Sign { .. } => Some("Sign"),
         Operation::Erf { .. } => Some("Erf"),
         Operation::Reciprocal { .. } => Some("Reciprocal"),
+        Operation::RoundEven { .. } => Some("Round"),
         Operation::Cast { .. } => Some("Cast"),
         Operation::Clamp { .. } => Some("Clamp"),
 
@@ -92,6 +93,7 @@ pub(crate) fn webnn_op_to_hiai(op: &Operation) -> Option<&'static str> {
         Operation::ConvTranspose2d { .. } => Some("ConvTranspose"),
         Operation::MaxPool2d { .. } => Some("MaxPool"),
         Operation::AveragePool2d { .. } => Some("AvgPool"),
+        Operation::L2Pool2d { .. } => Some("MaxPool"),
         Operation::Matmul { .. } => Some("MatMul"),
         Operation::Gemm { .. } => Some("Gemm"),
         Operation::Softmax { .. } => Some("Softmax"),
@@ -118,75 +120,61 @@ pub(crate) fn webnn_op_to_hiai(op: &Operation) -> Option<&'static str> {
         Operation::Split { .. } => Some("Split"),
         Operation::Concat { .. } => Some("Concat"),
         Operation::Pad { .. } => Some("Pad"),
-        Operation::Squeeze { .. } => Some("Squeeze"),
-        Operation::Unsqueeze { .. } => Some("Unsqueeze"),
+        Operation::Squeeze { .. } => Some("Reshape"),
+        Operation::Unsqueeze { .. } => Some("Reshape"),
         Operation::Expand { .. } => Some("Expand"),
         Operation::CumulativeSum { .. } => Some("CumulativeSum"),
 
         // ── Gather / Scatter / Where ─────────────────────────────────
         Operation::Gather { .. } => Some("Gather"),
-        Operation::GatherElements { .. } => Some("GatherElements"),
+        Operation::GatherElements { .. } => Some("Gather"),
         Operation::GatherND { .. } => Some("GatherND"),
-        Operation::ScatterElements { .. } => Some("ScatterElements"),
+        Operation::ScatterElements { .. } => Some("ScatterND"),
         Operation::ScatterND { .. } => Some("ScatterND"),
         Operation::Where { .. } => Some("Where"),
 
         // ── Normalization + Quantization ─────────────────────────────
         Operation::BatchNormalization { .. } => Some("BatchNormalization"),
-        Operation::InstanceNormalization { .. } => Some("InstanceNormalization"),
+        Operation::InstanceNormalization { .. } => Some("BatchNormalization"),
         Operation::QuantizeLinear { .. } => Some("QuantizeLinear"),
-        Operation::DequantizeLinear { .. } => Some("DequantizeLinear"),
+        Operation::DequantizeLinear { .. } => None,
 
         // ── Other ────────────────────────────────────────────────────
         Operation::Resample2d { .. } => Some("Resample2D"),
-        Operation::GlobalAveragePool { .. } => Some("GlobalAveragePool"),
-        Operation::GlobalMaxPool { .. } => Some("GlobalMaxPool"),
+        Operation::GlobalAveragePool { .. } => None,
+        Operation::GlobalMaxPool { .. } => None,
         Operation::Constant { .. } => Some("Constant"),
         Operation::Shape { .. } => Some("Shape"),
 
-        // ── Needs decomposition (Phase 3) ────────────────────────────
-        Operation::Identity { .. } => Some("Identity"),
+        // ── Needs decomposition ───────────────────────────────────────
+        Operation::Identity { .. } => None,
         Operation::Prelu { .. } => None,
         Operation::Linear { .. } => None,
         Operation::LayerNormalization { .. } => None,
         Operation::Triangular { .. } => None,
         Operation::IsNaN { .. } => None,
         Operation::IsInfinite { .. } => None,
+        Operation::Reverse { .. } => None,
 
-        // ── Not supported ────────────────────────────────────────────
+        // ── Not supported ─────────────────────────────────────────────
         Operation::Gru { .. }
         | Operation::GruCell { .. }
         | Operation::Lstm { .. }
-        | Operation::LstmCell { .. }
-        | Operation::L2Pool2d { .. }
-        | Operation::Reverse { .. }
-        | Operation::RoundEven { .. } => None,
+        | Operation::LstmCell { .. } => None,
     }
 }
 
-// The YoloV8s priority operators. encode_via_adapter (and the mock path) only
-// accept these; every other operation is reported as unsupported. The wiring
-// for other ops remains in place below for future re-enabling.
-pub(crate) fn is_supported_op(op: &Operation) -> bool {
+// Operations the CANN backend cannot express at all. RNN ops are the only
+// remaining gap: the Chromium reference leaves them NOTIMPLEMENTED() and the
+// adapter has no hiai op for them. Everything else is wired (or decomposed)
+// below.
+pub(crate) fn is_unsupported_op(op: &Operation) -> bool {
     matches!(
         op,
-        Operation::Add { .. }
-            | Operation::Sub { .. }
-            | Operation::Mul { .. }
-            | Operation::Div { .. }
-            | Operation::Conv2d { .. }
-            | Operation::MaxPool2d { .. }
-            | Operation::Concat { .. }
-            | Operation::Reshape { .. }
-            | Operation::Resample2d { .. }
-            | Operation::Sigmoid { .. }
-            | Operation::Slice { .. }
-            | Operation::Softmax { .. }
-            | Operation::Split { .. }
-            | Operation::Transpose { .. }
-            | Operation::Cast { .. }
-            | Operation::ReduceSum { .. }
-            | Operation::Prelu { .. }
+        Operation::Gru { .. }
+            | Operation::GruCell { .. }
+            | Operation::Lstm { .. }
+            | Operation::LstmCell { .. }
     )
 }
 
@@ -233,7 +221,7 @@ mod adapter {
             Operation::LogicalAnd { a, b, .. }
             | Operation::LogicalOr { a, b, .. }
             | Operation::LogicalXor { a, b, .. } => (*a, *b, "x1", "x2"),
-            Operation::Matmul { a, b, .. } | Operation::Gemm { a, b, .. } => (*a, *b, "x1", "x2"),
+            Operation::Matmul { a, b, .. } => (*a, *b, "x1", "x2"),
             _ => return None,
         };
         Some((a, b, name_a, name_b))
@@ -265,11 +253,13 @@ mod adapter {
             | Operation::Floor { input, .. }
             | Operation::Sign { input, .. }
             | Operation::Erf { input, .. }
-            | Operation::Reciprocal { input, .. } => Some(*input),
+            | Operation::Reciprocal { input, .. }
+            | Operation::RoundEven { input, .. } => Some(*input),
             Operation::Cast { input, .. } | Operation::Identity { input, .. } => Some(*input),
             Operation::Clamp { input, .. }
             | Operation::Softmax { input, .. }
-            | Operation::LogicalNot { input, .. } => Some(*input),
+            | Operation::LogicalNot { input, .. }
+            | Operation::Shape { input, .. } => Some(*input),
             _ => None,
         }
     }
@@ -284,6 +274,113 @@ mod adapter {
                 _ => 0,
             })
             .collect()
+    }
+
+    // Extract an f32 from a WebNN `MLNumber` (serde_json::Value number).
+    fn json_number_f32(value: &serde_json::Value) -> Option<f32> {
+        value
+            .as_f64()
+            .map(|f| f as f32)
+            .or_else(|| value.as_i64().map(|i| i as f32))
+            .or_else(|| value.as_u64().map(|u| u as f32))
+    }
+
+    // Reduce wiring info: (input, options, axes_as_attr, keep_dims_attr_name).
+    // sum/mean/max/min take axes as an int32 const input; product/l2/logSumExp
+    // take axes as an int64-list attr. `keep_dims_attr_name` differs
+    // ("keep_dims" vs "keepdims").
+    fn reduce_op_info(
+        op: &Operation,
+    ) -> Option<(
+        u32,
+        &Option<crate::operator_options::MLReduceOptions>,
+        bool,
+        &'static str,
+    )> {
+        match op {
+            Operation::ReduceSum { input, options, .. }
+            | Operation::ReduceMean { input, options, .. }
+            | Operation::ReduceMax { input, options, .. }
+            | Operation::ReduceMin { input, options, .. } => {
+                Some((*input, options, false, "keep_dims"))
+            }
+            Operation::ReduceProduct { input, options, .. }
+            | Operation::ReduceL2 { input, options, .. } => {
+                Some((*input, options, true, "keep_dims"))
+            }
+            Operation::ReduceLogSumExp { input, options, .. } => {
+                Some((*input, options, true, "keepdims"))
+            }
+            _ => None,
+        }
+    }
+
+    // Reduction axes: requested axes, or all axes when none are given.
+    fn reduce_axes(
+        input: u32,
+        options: &Option<crate::operator_options::MLReduceOptions>,
+        graph: &GraphInfo,
+    ) -> Vec<i32> {
+        let rank = graph.operands[input as usize].descriptor.shape.len();
+        options
+            .as_ref()
+            .and_then(|o| o.axes.as_ref())
+            .map(|a| a.iter().map(|&ax| ax as i32).collect())
+            .unwrap_or_else(|| (0..rank as u32).map(|ax| ax as i32).collect())
+    }
+
+    // Create a registered op by type name, registering it as an intermediate.
+    fn create_op(
+        type_str: &str,
+        name: &str,
+        extra_ops: &mut Vec<ddk_CannOperatorHandle>,
+    ) -> Result<ddk_CannOperatorHandle, GraphError> {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        let type_c = std::ffi::CString::new(type_str).unwrap();
+        let op = unsafe { ddk_cann_operator_create_registered(type_c.as_ptr(), name_c.as_ptr()) };
+        if op.is_null() {
+            return Err(GraphError::ConversionFailed {
+                format: "cann".into(),
+                reason: format!("cann_operator_create failed for {type_str} '{name}'").into(),
+            });
+        }
+        extra_ops.push(op);
+        Ok(op)
+    }
+
+    // Connect `name` input on `op` to `handle`.
+    fn connect_input(
+        op: ddk_CannOperatorHandle,
+        name: &str,
+        handle: ddk_CannOperatorHandle,
+    ) -> Result<(), GraphError> {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        let status = unsafe { ddk_cann_operator_set_input(op, name_c.as_ptr(), handle) };
+        if status != 0 {
+            return Err(GraphError::ConversionFailed {
+                format: "cann".into(),
+                reason: format!("cann_operator_set_input for '{name}' failed").into(),
+            });
+        }
+        Ok(())
+    }
+
+    // Set an int64 attr on `op`.
+    fn set_int64_attr(op: ddk_CannOperatorHandle, name: &str, value: i64) {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        unsafe { ddk_cann_operator_set_attr_int64(op, name_c.as_ptr(), value) };
+    }
+
+    // Set a bool attr on `op`.
+    fn set_bool_attr(op: ddk_CannOperatorHandle, name: &str, value: bool) {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        unsafe { ddk_cann_operator_set_attr_bool(op, name_c.as_ptr(), value as i32) };
+    }
+
+    // Set a float attr on `op`.
+    fn set_float_attr(op: ddk_CannOperatorHandle, name: &str, value: f32) {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        unsafe { ddk_cann_operator_set_attr_float(op, name_c.as_ptr(), value) };
     }
 
     // Create a Const operator holding the given tensor data, mirroring the
@@ -466,13 +563,48 @@ mod adapter {
             | Operation::ReduceSum { outputs, .. }
             // Normalization
             | Operation::BatchNormalization { outputs, .. }
-            // Shape / other (YoloV8s)
+            // Reduction (full set)
+            | Operation::ReduceMean { outputs, .. }
+            | Operation::ReduceMax { outputs, .. }
+            | Operation::ReduceMin { outputs, .. }
+            | Operation::ReduceProduct { outputs, .. }
+            | Operation::ReduceL1 { outputs, .. }
+            | Operation::ReduceL2 { outputs, .. }
+            | Operation::ReduceLogSum { outputs, .. }
+            | Operation::ReduceLogSumExp { outputs, .. }
+            | Operation::ReduceSumSquare { outputs, .. }
+            // Shape / other
             | Operation::Concat { outputs, .. }
             | Operation::Reshape { outputs, .. }
             | Operation::Resample2d { outputs, .. }
             | Operation::Slice { outputs, .. }
             | Operation::Split { outputs, .. }
-            | Operation::Transpose { outputs, .. } => outputs,
+            | Operation::Transpose { outputs, .. }
+            | Operation::Tile { outputs, .. }
+            | Operation::Pad { outputs, .. }
+            | Operation::Squeeze { outputs, .. }
+            | Operation::Unsqueeze { outputs, .. }
+            | Operation::Expand { outputs, .. }
+            | Operation::CumulativeSum { outputs, .. }
+            | Operation::Reverse { outputs, .. }
+            // Gather / Scatter / Where
+            | Operation::Gather { outputs, .. }
+            | Operation::GatherElements { outputs, .. }
+            | Operation::GatherND { outputs, .. }
+            | Operation::ScatterElements { outputs, .. }
+            | Operation::ScatterND { outputs, .. }
+            | Operation::Where { outputs, .. }
+            // Normalization / Quantization
+            | Operation::InstanceNormalization { outputs, .. }
+            | Operation::LayerNormalization { outputs, .. }
+            | Operation::QuantizeLinear { outputs, .. }
+            | Operation::DequantizeLinear { outputs, .. }
+            // Other
+            | Operation::Linear { outputs, .. }
+            | Operation::Triangular { outputs, .. }
+            | Operation::IsNaN { outputs, .. }
+            | Operation::IsInfinite { outputs, .. }
+            | Operation::RoundEven { outputs, .. } => outputs,
             _ => &[],
         }
     }
@@ -631,8 +763,8 @@ mod adapter {
         let mut extra_ops: Vec<ddk_CannOperatorHandle> = Vec::new();
 
         for op in &graph.operations {
-            // Phase-out gate: only the YoloV8s priority operators are accepted.
-            if !is_supported_op(op) {
+            // Only RNN ops are unsupported; everything else is wired below.
+            if is_unsupported_op(op) {
                 return Err(GraphError::ConversionFailed {
                     format: "cann".into(),
                     reason: format!("unsupported op: {}", op.label()).into(),
@@ -903,6 +1035,504 @@ mod adapter {
                 continue;
             }
 
+            // ArgMin = Neg(x) then ArgMaxExt2(neg, axis) (matching the reference).
+            if let Operation::ArgMin {
+                input,
+                axis,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let neg = create_op("Neg", &format!("argmin_neg_{out_id}"), &mut extra_ops)?;
+                connect_input(neg, "x", x_handle)?;
+
+                let argmax =
+                    create_op("ArgMax", &format!("argmin_argmax_{out_id}"), &mut extra_ops)?;
+                connect_input(argmax, "x", neg)?;
+                let axis_const = make_const(
+                    &format!("argmin_axis_{out_id}"),
+                    bytemuck::cast_slice(&[*axis as i32]),
+                    &[1],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axis_const);
+                connect_input(argmax, "axis", axis_const)?;
+
+                handles[out_id as usize] = argmax;
+                compute_ops.push(argmax);
+                continue;
+            }
+
+            // reduceL1 = Abs(x) -> ReduceSum(x, axes, keep_dims).
+            if let Operation::ReduceL1 {
+                input,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let abs_op = create_op("Abs", &format!("reduce_l1_abs_{out_id}"), &mut extra_ops)?;
+                connect_input(abs_op, "x", x_handle)?;
+                set_int64_attr(abs_op, "mode", 6);
+
+                let sum = create_op(
+                    "ReduceSum",
+                    &format!("reduce_l1_sum_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(sum, "x", abs_op)?;
+                let axes = reduce_axes(*input, options, graph);
+                let axes_const = make_const(
+                    &format!("reduce_l1_axes_{out_id}"),
+                    bytemuck::cast_slice(&axes),
+                    &[axes.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axes_const);
+                connect_input(sum, "axes", axes_const)?;
+                set_bool_attr(
+                    sum,
+                    "keep_dims",
+                    options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false),
+                );
+
+                handles[out_id as usize] = sum;
+                compute_ops.push(sum);
+                continue;
+            }
+
+            // reduceLogSum = Log(ReduceSum(x, axes, keep_dims)).
+            if let Operation::ReduceLogSum {
+                input,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let sum = create_op(
+                    "ReduceSum",
+                    &format!("reduce_log_sum_sum_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(sum, "x", x_handle)?;
+                let axes = reduce_axes(*input, options, graph);
+                let axes_const = make_const(
+                    &format!("reduce_log_sum_axes_{out_id}"),
+                    bytemuck::cast_slice(&axes),
+                    &[axes.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axes_const);
+                connect_input(sum, "axes", axes_const)?;
+                set_bool_attr(
+                    sum,
+                    "keep_dims",
+                    options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false),
+                );
+
+                let log_op = create_op(
+                    "Log",
+                    &format!("reduce_log_sum_log_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(log_op, "x", sum)?;
+
+                handles[out_id as usize] = log_op;
+                compute_ops.push(log_op);
+                continue;
+            }
+
+            // reduceSumSquare = ReduceSum(Square(x), axes, keep_dims).
+            if let Operation::ReduceSumSquare {
+                input,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let square = create_op(
+                    "Square",
+                    &format!("reduce_sum_square_sq_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(square, "x", x_handle)?;
+
+                let sum = create_op(
+                    "ReduceSum",
+                    &format!("reduce_sum_square_sum_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(sum, "x", square)?;
+                let axes = reduce_axes(*input, options, graph);
+                let axes_const = make_const(
+                    &format!("reduce_sum_square_axes_{out_id}"),
+                    bytemuck::cast_slice(&axes),
+                    &[axes.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axes_const);
+                connect_input(sum, "axes", axes_const)?;
+                set_bool_attr(
+                    sum,
+                    "keep_dims",
+                    options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false),
+                );
+
+                handles[out_id as usize] = sum;
+                compute_ops.push(sum);
+                continue;
+            }
+
+            // Identity = Reshape(x, Shape(x)).
+            if let Operation::Identity { input, outputs, .. } = op {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let shape_op =
+                    create_op("Shape", &format!("identity_shape_{out_id}"), &mut extra_ops)?;
+                connect_input(shape_op, "x", x_handle)?;
+
+                let reshape = create_op(
+                    "Reshape",
+                    &format!("identity_reshape_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(reshape, "x", x_handle)?;
+                connect_input(reshape, "shape", shape_op)?;
+
+                handles[out_id as usize] = reshape;
+                compute_ops.push(reshape);
+                continue;
+            }
+
+            // isNaN = NotEqual(x, x).
+            if let Operation::IsNaN { input, outputs, .. } = op {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let ne = create_op("NotEqual", &format!("isnan_ne_{out_id}"), &mut extra_ops)?;
+                connect_input(ne, "x1", x_handle)?;
+                connect_input(ne, "x2", x_handle)?;
+
+                handles[out_id as usize] = ne;
+                compute_ops.push(ne);
+                continue;
+            }
+
+            // isInfinite = (x == +inf) || (x == -inf).
+            if let Operation::IsInfinite { input, outputs, .. } = op {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let in_dims = descriptor_dims(&graph.operands[*input as usize].descriptor);
+                let shape_const = make_const(
+                    &format!("isinfinite_shape_{out_id}"),
+                    bytemuck::cast_slice(&in_dims.iter().map(|&d| d as i32).collect::<Vec<_>>()),
+                    &[in_dims.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(shape_const);
+
+                let pos = make_const(
+                    &format!("isinfinite_pos_{out_id}"),
+                    bytemuck::cast_slice(&[f32::INFINITY]),
+                    &[1],
+                    ddk_CannDataType::CANN_DT_FLOAT,
+                    0,
+                );
+                let neg = make_const(
+                    &format!("isinfinite_neg_{out_id}"),
+                    bytemuck::cast_slice(&[f32::NEG_INFINITY]),
+                    &[1],
+                    ddk_CannDataType::CANN_DT_FLOAT,
+                    0,
+                );
+                extra_ops.push(pos);
+                extra_ops.push(neg);
+
+                let pos_b = create_op(
+                    "Expand",
+                    &format!("isinfinite_pos_b_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(pos_b, "x", pos)?;
+                connect_input(pos_b, "shape", shape_const)?;
+                let neg_b = create_op(
+                    "Expand",
+                    &format!("isinfinite_neg_b_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(neg_b, "x", neg)?;
+                connect_input(neg_b, "shape", shape_const)?;
+
+                let eq_pos = create_op(
+                    "Equal",
+                    &format!("isinfinite_eq_pos_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(eq_pos, "x1", x_handle)?;
+                connect_input(eq_pos, "x2", pos_b)?;
+                let eq_neg = create_op(
+                    "Equal",
+                    &format!("isinfinite_eq_neg_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(eq_neg, "x1", x_handle)?;
+                connect_input(eq_neg, "x2", neg_b)?;
+
+                let or_op = create_op(
+                    "LogicalOr",
+                    &format!("isinfinite_or_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(or_op, "x1", eq_pos)?;
+                connect_input(or_op, "x2", eq_neg)?;
+
+                handles[out_id as usize] = or_op;
+                compute_ops.push(or_op);
+                continue;
+            }
+
+            // globalAveragePool = ReduceMean over spatial (H, W) axes.
+            if let Operation::GlobalAveragePool { input, outputs, .. } = op {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let mean = create_op(
+                    "ReduceMean",
+                    &format!("global_avg_pool_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(mean, "x", x_handle)?;
+                let rank = graph.operands[*input as usize].descriptor.shape.len();
+                let axes: Vec<i32> = if rank >= 2 {
+                    vec![(rank as i32) - 2, (rank as i32) - 1]
+                } else {
+                    vec![0]
+                };
+                let axes_const = make_const(
+                    &format!("global_avg_pool_axes_{out_id}"),
+                    bytemuck::cast_slice(&axes),
+                    &[axes.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axes_const);
+                connect_input(mean, "axes", axes_const)?;
+                set_bool_attr(mean, "keep_dims", true);
+
+                handles[out_id as usize] = mean;
+                compute_ops.push(mean);
+                continue;
+            }
+
+            // globalMaxPool = ReduceMax over spatial (H, W) axes.
+            if let Operation::GlobalMaxPool { input, outputs, .. } = op {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let max = create_op(
+                    "ReduceMax",
+                    &format!("global_max_pool_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(max, "x", x_handle)?;
+                let rank = graph.operands[*input as usize].descriptor.shape.len();
+                let axes: Vec<i32> = if rank >= 2 {
+                    vec![(rank as i32) - 2, (rank as i32) - 1]
+                } else {
+                    vec![0]
+                };
+                let axes_const = make_const(
+                    &format!("global_max_pool_axes_{out_id}"),
+                    bytemuck::cast_slice(&axes),
+                    &[axes.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axes_const);
+                connect_input(max, "axes", axes_const)?;
+                set_bool_attr(max, "keep_dims", true);
+
+                handles[out_id as usize] = max;
+                compute_ops.push(max);
+                continue;
+            }
+
+            // linear(x) = alpha * x + beta.
+            if let Operation::Linear {
+                input,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let alpha = options.as_ref().map(|o| o.alpha as f32).unwrap_or(1.0);
+                let beta = options.as_ref().map(|o| o.beta as f32).unwrap_or(0.0);
+                let in_dims = descriptor_dims(&graph.operands[*input as usize].descriptor);
+                let shape_vals: Vec<i32> = in_dims.iter().map(|&d| d as i32).collect();
+                let shape_const = make_const(
+                    &format!("linear_shape_{out_id}"),
+                    bytemuck::cast_slice(&shape_vals),
+                    &[shape_vals.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(shape_const);
+
+                let alpha_const = make_const(
+                    &format!("linear_alpha_{out_id}"),
+                    bytemuck::cast_slice(&[alpha]),
+                    &[1],
+                    ddk_CannDataType::CANN_DT_FLOAT,
+                    0,
+                );
+                let beta_const = make_const(
+                    &format!("linear_beta_{out_id}"),
+                    bytemuck::cast_slice(&[beta]),
+                    &[1],
+                    ddk_CannDataType::CANN_DT_FLOAT,
+                    0,
+                );
+                extra_ops.push(alpha_const);
+                extra_ops.push(beta_const);
+
+                let alpha_b = create_op(
+                    "Expand",
+                    &format!("linear_alpha_b_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(alpha_b, "x", alpha_const)?;
+                connect_input(alpha_b, "shape", shape_const)?;
+                let beta_b =
+                    create_op("Expand", &format!("linear_beta_b_{out_id}"), &mut extra_ops)?;
+                connect_input(beta_b, "x", beta_const)?;
+                connect_input(beta_b, "shape", shape_const)?;
+
+                let mul = create_op("Mul", &format!("linear_mul_{out_id}"), &mut extra_ops)?;
+                connect_input(mul, "x1", x_handle)?;
+                connect_input(mul, "x2", alpha_b)?;
+                let add = create_op("Add", &format!("linear_add_{out_id}"), &mut extra_ops)?;
+                connect_input(add, "x1", mul)?;
+                connect_input(add, "x2", beta_b)?;
+
+                handles[out_id as usize] = add;
+                compute_ops.push(add);
+                continue;
+            }
+
+            // reverse via hiai::op::StridedSliceV2 (begin/end/strides + end_mask).
+            if let Operation::Reverse {
+                input,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let out_id = outputs[0];
+                let in_dims = descriptor_dims(&graph.operands[*input as usize].descriptor);
+                let rank = in_dims.len();
+                let axes: Vec<u32> = options
+                    .as_ref()
+                    .and_then(|o| o.axes.clone())
+                    .unwrap_or_else(|| (0..rank as u32).collect());
+
+                let mut begin: Vec<i32> = vec![0; rank];
+                let end: Vec<i32> = vec![-1; rank];
+                let mut strides: Vec<i32> = vec![1; rank];
+                let mut end_mask: i64 = 0;
+                for &ax in &axes {
+                    if (ax as usize) < rank {
+                        begin[ax as usize] = in_dims[ax as usize] as i32 - 1;
+                        strides[ax as usize] = -1;
+                        end_mask |= 1 << ax;
+                    }
+                }
+
+                let slice = create_op(
+                    "StridedSliceV2",
+                    &format!("reverse_slice_{out_id}"),
+                    &mut extra_ops,
+                )?;
+                connect_input(slice, "x", x_handle)?;
+                let begin_const = make_const(
+                    &format!("reverse_begin_{out_id}"),
+                    bytemuck::cast_slice(&begin),
+                    &[rank as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                let end_const = make_const(
+                    &format!("reverse_end_{out_id}"),
+                    bytemuck::cast_slice(&end),
+                    &[rank as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                let strides_const = make_const(
+                    &format!("reverse_strides_{out_id}"),
+                    bytemuck::cast_slice(&strides),
+                    &[rank as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(begin_const);
+                extra_ops.push(end_const);
+                extra_ops.push(strides_const);
+                connect_input(slice, "begin", begin_const)?;
+                connect_input(slice, "end", end_const)?;
+                connect_input(slice, "strides", strides_const)?;
+                set_int64_attr(slice, "end_mask", end_mask);
+
+                handles[out_id as usize] = slice;
+                compute_ops.push(slice);
+                continue;
+            }
+
+            // dequantizeLinear = Mul(Sub(Cast(x, float), zp), scale).
+            if let Operation::DequantizeLinear {
+                input,
+                scale,
+                zero_point,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                let scale_handle = handles[*scale as usize];
+                let out_id = outputs[0];
+
+                let src_dtype = graph.operands[*input as usize].descriptor.data_type;
+                let cast = create_op("Cast", &format!("dequant_cast_{out_id}"), &mut extra_ops)?;
+                connect_input(cast, "x", x_handle)?;
+                set_int64_attr(cast, "src_dtype", cann_data_type(src_dtype) as i64);
+                set_int64_attr(cast, "dst_dtype", ddk_CannDataType::CANN_DT_FLOAT as i64);
+
+                let sub = create_op("Sub", &format!("dequant_sub_{out_id}"), &mut extra_ops)?;
+                connect_input(sub, "x1", cast)?;
+                if let Some(zp_id) = zero_point {
+                    connect_input(sub, "x2", handles[*zp_id as usize])?;
+                }
+                let mul = create_op("Mul", &format!("dequant_mul_{out_id}"), &mut extra_ops)?;
+                connect_input(mul, "x1", sub)?;
+                connect_input(mul, "x2", scale_handle)?;
+
+                handles[out_id as usize] = mul;
+                compute_ops.push(mul);
+                continue;
+            }
+
             let operator_type_name = match webnn_op_to_hiai(op) {
                 Some(name) => CString::new(name).unwrap(),
                 None => {
@@ -964,6 +1594,69 @@ mod adapter {
                 }
             }
 
+            // Activation / clamp attributes. The generic unary path only wires
+            // the "x" input; these ops map to hiai::op::Activation (or
+            // ClipByValue) and require the mode / bounds to be set explicitly.
+            let mode_name = CString::new("mode").unwrap();
+            match op {
+                Operation::Relu { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 1);
+                },
+                Operation::Tanh { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 2);
+                },
+                Operation::Abs { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 6);
+                },
+                Operation::Softplus { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 9);
+                },
+                Operation::Softsign { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 8);
+                },
+                Operation::Gelu { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 15);
+                },
+                Operation::HardSigmoid { .. } => unsafe {
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 10);
+                },
+                Operation::LeakyRelu { options, .. } => {
+                    let alpha = options.as_ref().map(|o| o.alpha as f32).unwrap_or(0.01);
+                    let slope_name = CString::new("negative_slope").unwrap();
+                    unsafe {
+                        ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 5);
+                        ddk_cann_operator_set_attr_float(compute_op, slope_name.as_ptr(), alpha);
+                    }
+                }
+                Operation::Elu { options, .. } => {
+                    let alpha = options.as_ref().map(|o| o.alpha as f32).unwrap_or(1.0);
+                    let coef_name = CString::new("coef").unwrap();
+                    unsafe {
+                        ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 4);
+                        ddk_cann_operator_set_attr_float(compute_op, coef_name.as_ptr(), alpha);
+                    }
+                }
+                Operation::Clamp { options, .. } => {
+                    let min = options
+                        .as_ref()
+                        .and_then(|o| o.min_value.as_ref())
+                        .and_then(json_number_f32)
+                        .unwrap_or(f32::NEG_INFINITY);
+                    let max = options
+                        .as_ref()
+                        .and_then(|o| o.max_value.as_ref())
+                        .and_then(json_number_f32)
+                        .unwrap_or(f32::INFINITY);
+                    let min_name = CString::new("min").unwrap();
+                    let max_name = CString::new("max").unwrap();
+                    unsafe {
+                        ddk_cann_operator_set_attr_float(compute_op, min_name.as_ptr(), min);
+                        ddk_cann_operator_set_attr_float(compute_op, max_name.as_ptr(), max);
+                    }
+                }
+                _ => {}
+            }
+
             // Wire Cast via hiai::op::CastT (adapter maps "Cast"; attrs
             // src_dtype/dst_dtype).
             if let Operation::Cast { input, outputs, .. } = op {
@@ -985,15 +1678,10 @@ mod adapter {
                 }
             }
 
-            // Wire ReduceSum via hiai::op::ReduceSum (x + axes const + keep_dims).
-            if let Operation::ReduceSum {
-                input,
-                options,
-                outputs,
-                ..
-            } = op
-            {
-                let x_handle = handles[*input as usize];
+            // Wire reductions (sum/mean/max/min/product/l2/logSumExp). L1,
+            // logSum and sumSquare are decomposed earlier.
+            if let Some((input, options, axes_as_attr, keep_dims_attr_name)) = reduce_op_info(op) {
+                let x_handle = handles[input as usize];
                 let x_name = CString::new("x").unwrap();
                 let status = unsafe { set_operand_input(compute_op, &x_name, x_handle) };
                 if status != 0 {
@@ -1006,35 +1694,44 @@ mod adapter {
                     });
                 }
 
-                // axes const: reduce over the requested axes, or all axes if none.
-                // HIAI ReduceSum declares axes as DT_INT32.
-                let rank = graph.operands[*input as usize].descriptor.shape.len();
-                let axes: Vec<i32> = options
-                    .as_ref()
-                    .and_then(|o| o.axes.as_ref())
-                    .map(|a| a.iter().map(|&ax| ax as i32).collect())
-                    .unwrap_or_else(|| (0..rank as u32).map(|ax| ax as i32).collect());
-                let axes_const = make_const(
-                    &format!("reduce_sum_axes_{}", outputs[0]),
-                    bytemuck::cast_slice(&axes),
-                    &[axes.len() as i64],
-                    ddk_CannDataType::CANN_DT_INT32,
-                    2, // FORMAT_ND
-                );
-                extra_ops.push(axes_const);
-                let axes_name = CString::new("axes").unwrap();
-                unsafe {
-                    ddk_cann_operator_set_input(compute_op, axes_name.as_ptr(), axes_const);
-                }
-
+                let axes = reduce_axes(input, options, graph);
                 let keep_dims = options.as_ref().map(|o| o.keep_dimensions).unwrap_or(false);
-                let keep_dims_name = CString::new("keep_dims").unwrap();
-                unsafe {
-                    ddk_cann_operator_set_attr_bool(
-                        compute_op,
-                        keep_dims_name.as_ptr(),
-                        keep_dims as i32,
+                let keep_dims_name = CString::new(keep_dims_attr_name).unwrap();
+
+                if axes_as_attr {
+                    let axes_i64: Vec<i64> = axes.iter().map(|&ax| ax as i64).collect();
+                    let axes_name = CString::new("axes").unwrap();
+                    unsafe {
+                        ddk_cann_operator_set_attr_int64_list(
+                            compute_op,
+                            axes_name.as_ptr(),
+                            axes_i64.as_ptr(),
+                            axes_i64.len() as i32,
+                        );
+                        ddk_cann_operator_set_attr_bool(
+                            compute_op,
+                            keep_dims_name.as_ptr(),
+                            keep_dims as i32,
+                        );
+                    }
+                } else {
+                    let axes_const = make_const(
+                        &format!("reduce_axes_{}", op_outputs(op)[0]),
+                        bytemuck::cast_slice(&axes),
+                        &[axes.len() as i64],
+                        ddk_CannDataType::CANN_DT_INT32,
+                        2, // FORMAT_ND
                     );
+                    extra_ops.push(axes_const);
+                    let axes_name = CString::new("axes").unwrap();
+                    unsafe {
+                        ddk_cann_operator_set_input(compute_op, axes_name.as_ptr(), axes_const);
+                        ddk_cann_operator_set_attr_bool(
+                            compute_op,
+                            keep_dims_name.as_ptr(),
+                            keep_dims as i32,
+                        );
+                    }
                 }
             }
 
@@ -1169,9 +1866,14 @@ mod adapter {
                 }
             }
 
-            // Wire MaxPool2d via hiai::op::PoolingD.
-            if let Operation::MaxPool2d { input, options, .. } = op {
-                let x_handle = handles[*input as usize];
+            // Wire pooling (max/average/l2) via hiai::op::PoolingD.
+            if let Some((input, options, pool_mode)) = match op {
+                Operation::MaxPool2d { input, options, .. } => Some((*input, options, 0)),
+                Operation::AveragePool2d { input, options, .. } => Some((*input, options, 1)),
+                Operation::L2Pool2d { input, options, .. } => Some((*input, options, 2)),
+                _ => None,
+            } {
+                let x_handle = handles[input as usize];
                 let x_name = CString::new("x").unwrap();
                 let status = unsafe { set_operand_input(compute_op, &x_name, x_handle) };
                 if status != 0 {
@@ -1184,7 +1886,7 @@ mod adapter {
                     });
                 }
 
-                // hiai::op::PoolingD: mode(0=max), window(2), stride(2), pad(4).
+                // hiai::op::PoolingD: mode(0=max,1=avg,2=l2), window(2), stride(2), pad(4).
                 let mut window_h: i64 = 1;
                 let mut window_w: i64 = 1;
                 let mut stride_h: i64 = 1;
@@ -1193,7 +1895,7 @@ mod adapter {
                 let mut padding_bottom: i64 = 0;
                 let mut padding_left: i64 = 0;
                 let mut padding_right: i64 = 0;
-                if let Some(pool_options) = options {
+                if let Some(pool_options) = options.as_ref() {
                     if pool_options.padding.len() >= 4 {
                         padding_top = pool_options.padding[0] as i64;
                         padding_bottom = pool_options.padding[1] as i64;
@@ -1217,7 +1919,7 @@ mod adapter {
                 let pad: [i64; 4] = [padding_top, padding_bottom, padding_left, padding_right];
                 unsafe {
                     let mode_name = CString::new("mode").unwrap();
-                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), 0);
+                    ddk_cann_operator_set_attr_int64(compute_op, mode_name.as_ptr(), pool_mode);
                     let window_name = CString::new("window").unwrap();
                     ddk_cann_operator_set_attr_int64_list(
                         compute_op,
@@ -1529,8 +2231,13 @@ mod adapter {
                 }
             }
 
-            // Wire Reshape via hiai::op::Reshape (x + shape const).
-            if let Operation::Reshape { input, outputs, .. } = op {
+            // Wire Reshape / Squeeze / Unsqueeze via hiai::op::Reshape (x + shape
+            // const). Squeeze/unsqueeze only change shape, so the output operand's
+            // shape is the correct target.
+            if let Operation::Reshape { input, outputs, .. }
+            | Operation::Squeeze { input, outputs, .. }
+            | Operation::Unsqueeze { input, outputs, .. } = op
+            {
                 let x_handle = handles[*input as usize];
                 let x_name = CString::new("x").unwrap();
                 let status = unsafe { set_operand_input(compute_op, &x_name, x_handle) };
@@ -1642,6 +2349,196 @@ mod adapter {
                 unsafe {
                     ddk_cann_operator_set_input(compute_op, perm_name.as_ptr(), perm_const);
                 }
+            }
+
+            // Wire Gemm via hiai::op::GemmD (a, b, optional c + alpha/beta/transpose).
+            if let Operation::Gemm { a, b, options, .. } = op {
+                connect_input(compute_op, "a", handles[*a as usize])?;
+                connect_input(compute_op, "b", handles[*b as usize])?;
+                if let Some(o) = options.as_ref() {
+                    set_float_attr(compute_op, "alpha", o.alpha as f32);
+                    set_float_attr(compute_op, "beta", o.beta as f32);
+                    set_bool_attr(compute_op, "transpose_a", o.a_transpose);
+                    set_bool_attr(compute_op, "transpose_b", o.b_transpose);
+                    if let Some(c_id) = o.c {
+                        connect_input(compute_op, "c", handles[c_id as usize])?;
+                    }
+                }
+            }
+
+            // Wire Pad via hiai::op::Pad (x + paddings const, shape [N, 2]).
+            if let Operation::Pad {
+                input,
+                beginning_padding,
+                ending_padding,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                connect_input(compute_op, "x", x_handle)?;
+                let rank = beginning_padding.len();
+                let mut paddings: Vec<i32> = Vec::with_capacity(rank * 2);
+                for i in 0..rank {
+                    paddings.push(beginning_padding[i] as i32);
+                    paddings.push(ending_padding[i] as i32);
+                }
+                let paddings_const = make_const(
+                    &format!("pad_paddings_{}", outputs[0]),
+                    bytemuck::cast_slice(&paddings),
+                    &[rank as i64, 2],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(paddings_const);
+                connect_input(compute_op, "paddings", paddings_const)?;
+            }
+
+            // Wire Expand via hiai::op::BroadcastTo (x + shape const).
+            if let Operation::Expand { input, outputs, .. } = op {
+                let x_handle = handles[*input as usize];
+                connect_input(compute_op, "x", x_handle)?;
+                let shape_vals: Vec<i32> =
+                    descriptor_dims(&graph.operands[outputs[0] as usize].descriptor)
+                        .iter()
+                        .map(|&d| d as i32)
+                        .collect();
+                let shape_const = make_const(
+                    &format!("expand_shape_{}", outputs[0]),
+                    bytemuck::cast_slice(&shape_vals),
+                    &[shape_vals.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(shape_const);
+                connect_input(compute_op, "shape", shape_const)?;
+            }
+
+            // Wire Tile via hiai::op::Tile (x + multiples const).
+            if let Operation::Tile {
+                input,
+                repetitions,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                connect_input(compute_op, "x", x_handle)?;
+                let multiples: Vec<i32> = repetitions.iter().map(|&r| r as i32).collect();
+                let multiples_const = make_const(
+                    &format!("tile_multiples_{}", outputs[0]),
+                    bytemuck::cast_slice(&multiples),
+                    &[multiples.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(multiples_const);
+                connect_input(compute_op, "multiples", multiples_const)?;
+            }
+
+            // Wire CumulativeSum via ge::op::Cumsum (x + axis const + exclusive/reverse).
+            if let Operation::CumulativeSum {
+                input,
+                axis,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                let x_handle = handles[*input as usize];
+                connect_input(compute_op, "x", x_handle)?;
+                let axis_const = make_const(
+                    &format!("cumsum_axis_{}", outputs[0]),
+                    bytemuck::cast_slice(&[*axis as i32]),
+                    &[1],
+                    ddk_CannDataType::CANN_DT_INT32,
+                    2,
+                );
+                extra_ops.push(axis_const);
+                connect_input(compute_op, "axis", axis_const)?;
+                if let Some(o) = options.as_ref() {
+                    set_bool_attr(compute_op, "exclusive", o.exclusive);
+                    set_bool_attr(compute_op, "reverse", o.reversed);
+                }
+            }
+
+            // Wire Gather / GatherElements via hiai::op::GatherV2D (x + indices + axis).
+            if let Operation::Gather {
+                input,
+                indices,
+                options,
+                ..
+            }
+            | Operation::GatherElements {
+                input,
+                indices,
+                options,
+                ..
+            } = op
+            {
+                connect_input(compute_op, "x", handles[*input as usize])?;
+                connect_input(compute_op, "indices", handles[*indices as usize])?;
+                let axis = options.as_ref().map(|o| o.axis as i64).unwrap_or(0);
+                set_int64_attr(compute_op, "axis", axis);
+            }
+
+            // Wire GatherND via hiai::op::GatherNd (x + indices).
+            if let Operation::GatherND { input, indices, .. } = op {
+                connect_input(compute_op, "x", handles[*input as usize])?;
+                connect_input(compute_op, "indices", handles[*indices as usize])?;
+            }
+
+            // Wire ScatterElements / ScatterND via hiai::op::ScatterNdUpdate.
+            if let Operation::ScatterElements {
+                input,
+                indices,
+                updates,
+                ..
+            }
+            | Operation::ScatterND {
+                input,
+                indices,
+                updates,
+                ..
+            } = op
+            {
+                connect_input(compute_op, "var", handles[*input as usize])?;
+                connect_input(compute_op, "indices", handles[*indices as usize])?;
+                connect_input(compute_op, "updates", handles[*updates as usize])?;
+            }
+
+            // Wire Where via hiai::op::Select (condition, x1, x2).
+            if let Operation::Where {
+                condition,
+                true_value,
+                false_value,
+                ..
+            } = op
+            {
+                connect_input(compute_op, "condition", handles[*condition as usize])?;
+                connect_input(compute_op, "x1", handles[*true_value as usize])?;
+                connect_input(compute_op, "x2", handles[*false_value as usize])?;
+            }
+
+            // Wire InstanceNormalization via hiai::op::BNInference (x + epsilon + scale/offset).
+            if let Operation::InstanceNormalization { input, options, .. } = op {
+                connect_input(compute_op, "x", handles[*input as usize])?;
+                if let Some(o) = options.as_ref() {
+                    set_float_attr(compute_op, "epsilon", o.epsilon as f32);
+                    if let Some(scale_id) = o.scale {
+                        connect_input(compute_op, "scale", handles[scale_id as usize])?;
+                    }
+                    if let Some(bias_id) = o.bias {
+                        connect_input(compute_op, "offset", handles[bias_id as usize])?;
+                    }
+                }
+            }
+
+            // Wire QuantizeLinear via hiai::op::QuantizeV2 (x + dtype; scale/zero_point
+            // wiring is a TODO matching the reference).
+            if let Operation::QuantizeLinear { input, .. } = op {
+                connect_input(compute_op, "x", handles[*input as usize])?;
+                set_int64_attr(compute_op, "dtype", ddk_CannDataType::CANN_DT_UINT8 as i64);
             }
 
             let outputs: &[u32] = op_outputs(op);
@@ -1915,7 +2812,7 @@ impl GraphConverter for CannConverter {
 fn build_hiai_ir_model_mock(graph: &GraphInfo) -> Result<Vec<u8>, GraphError> {
     let mut operation_count: usize = 0;
     for operation in &graph.operations {
-        if is_supported_op(operation) {
+        if !is_unsupported_op(operation) {
             operation_count += 1;
         }
     }
@@ -2169,6 +3066,6 @@ mod tests {
             options: None,
             outputs: vec![1],
         };
-        assert_eq!(webnn_op_to_hiai(&op), Some("Identity"));
+        assert_eq!(webnn_op_to_hiai(&op), None);
     }
 }

@@ -51,7 +51,7 @@ pub fn should_skip_test_by_ops(
             "operation '{operation}' not supported by litert backend"
         ));
     }
-    if backend_prefix == "cann" && rustnn::backends::cann::op_unsupported(operation) {
+    if backend_prefix == "cann" && rustnn::backends::cann::unsupported_ops().contains(&operation) {
         return Some(format!(
             "operation '{operation}' not supported by cann backend"
         ));
