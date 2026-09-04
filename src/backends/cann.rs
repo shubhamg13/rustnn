@@ -19,6 +19,7 @@ use std::fmt;
 
 use crate::GraphInfo;
 use crate::backend_selection::DeviceType;
+#[cfg(feature = "cann-runtime")]
 use crate::converters::cann::encode_via_adapter;
 use crate::error::{Error, Result};
 use crate::mlcontext::MLBackendGraph::CannEngine;
@@ -29,7 +30,7 @@ use crate::mlcontext::{
 #[cfg(feature = "cann-runtime")]
 use crate::operator_enums::MLOperandDataType;
 #[cfg(feature = "cann-runtime")]
-use hiai_rs::{TensorDesc, dispatch};
+use hiai_rs::{Session, TensorDesc};
 
 /// WebNN operations the CANN backend cannot express at all. RNN ops are the
 /// only remaining gap (matching `converters::cann::is_unsupported_op`); every
@@ -67,7 +68,13 @@ pub(crate) struct CannTensor {
 // constructs a graph.
 #[allow(dead_code)]
 pub(crate) struct CannGraph {
-    pub(crate) model_bytes: Vec<u8>,
+    // The compiled model, loaded into the NPU at `build()` time (matching
+    // Chromium's architecture: `BuildModel` + `LoadModelsByHcl` happen in
+    // `build()`, and `dispatch()` only runs). Wrapped in a `Mutex` because
+    // `Session` is `Send` but not `Sync` (its `dispatch` mutates the DDK model
+    // manager internally), and `CannGraph` must stay `Send + Sync`.
+    #[cfg(feature = "cann-runtime")]
+    pub(crate) session: std::sync::Mutex<Session>,
     // Input/output names in the model's canonical order (matching how the
     // graph was compiled). dispatch() relies on this to feed tensors to the
     // NPU positionally, since MLNamedTensors (a BTreeMap) sorts by name rather
@@ -201,7 +208,7 @@ impl<'context> MLBackendContext<'context> for CannContext {
             });
         };
 
-        let model_bytes = &cann_graph.model_bytes;
+        let t0 = std::time::Instant::now();
 
         let build_desc = |tensor: &&MLTensor| -> TensorDesc {
             TensorDesc {
@@ -232,12 +239,19 @@ impl<'context> MLBackendContext<'context> for CannContext {
                 })?;
             output_descs.push(build_desc(tensor));
         }
+        let t1 = std::time::Instant::now();
 
-        dispatch(model_bytes, &input_descs, &mut output_descs).map_err(|e| {
-            Error::GraphDispatchError {
+        // The model was compiled and loaded at `build()` time; just run the
+        // preloaded session.
+        cann_graph
+            .session
+            .lock()
+            .expect("session mutex poisoned")
+            .dispatch(&input_descs, &mut output_descs)
+            .map_err(|e| Error::GraphDispatchError {
                 source: Box::new(e),
-            }
-        })?;
+            })?;
+        let t2 = std::time::Instant::now();
 
         for (name, output_desc) in cann_graph.output_names.iter().zip(output_descs.iter()) {
             let tensor = outputs
@@ -245,10 +259,22 @@ impl<'context> MLBackendContext<'context> for CannContext {
                 .ok_or_else(|| Error::GraphDispatchError {
                     source: format!("missing output '{name}' for CANN dispatch").into(),
                 })?;
-            self.tensors[tensor.id]
-                .memory
-                .copy_from_slice(&output_desc.data);
+            // hiai-rs `dispatch` truncates `output_desc.data` to the actual
+            // produced size, so resize the destination to match before copying
+            // (avoids a length-mismatch panic when the model output is smaller
+            // than the pre-allocated tensor buffer).
+            let mem = &mut self.tensors[tensor.id].memory;
+            mem.truncate(output_desc.data.len());
+            mem.copy_from_slice(&output_desc.data);
         }
+        let t3 = std::time::Instant::now();
+
+        log::error!(
+            "[cann-timing] clone={:.2}ms dispatch={:.2}ms copyback={:.2}ms",
+            (t1 - t0).as_secs_f64() * 1e3,
+            (t2 - t1).as_secs_f64() * 1e3,
+            (t3 - t2).as_secs_f64() * 1e3,
+        );
 
         Ok(())
     }
@@ -292,12 +318,6 @@ impl fmt::Debug for CannBuilder {
 
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CannBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> Result<MLGraph<'context>> {
-        // Build the CANN graph and compile to offline model bytes.
-        let model_bytes =
-            encode_via_adapter(&graph_info).map_err(|e| Error::GraphDispatchError {
-                source: format!("CANN graph build failed: {e}").into(),
-            })?;
-
         // Record the input/output names in the model's canonical order. Names
         // are guaranteed present: MLGraph::new() below runs io_binding_maps(),
         // which errors on missing or duplicate names.
@@ -322,10 +342,28 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CannBuilder {
             })
             .collect();
 
+        // Compile and load the model into the NPU now, at `build()` time
+        // (matching Chromium, where the compile is attributed to build(), not
+        // to the first dispatch). `dispatch()` then just runs the loaded
+        // session, so the compile cost is outside the measured "Inference".
+        #[cfg(feature = "cann-runtime")]
+        let session = {
+            let model_bytes =
+                encode_via_adapter(&graph_info).map_err(|e| Error::GraphBuildError {
+                    source: format!("CANN graph build failed: {e}").into(),
+                })?;
+            std::sync::Mutex::new(Session::load(&model_bytes).map_err(|e| {
+                Error::GraphBuildError {
+                    source: Box::new(e),
+                }
+            })?)
+        };
+
         let graph = CannGraph {
-            model_bytes,
             input_names,
             output_names,
+            #[cfg(feature = "cann-runtime")]
+            session,
         };
         MLGraph::new(CannEngine(graph), &graph_info)
     }

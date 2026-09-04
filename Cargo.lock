@@ -1238,6 +1238,7 @@ name = "hiai-rs"
 version = "0.1.0"
 dependencies = [
  "hiai-rs-sys",
+ "log",
  "thiserror 2.0.19",
 ]
 

@@ -27,6 +27,30 @@ use crate::operators::Operation;
 use std::collections::{BTreeMap, HashMap};
 use webnn_graph::ast::{ConstDecl, ConstInit, GraphJson, Node, OperandDesc};
 
+/// Map ONNX-style op names in the `.webnn` DSL to WebNN op names. Some exported
+/// graphs use ONNX names (`Conv`, `Transpose`, `MaxPool`, `Pad`, ...) instead of
+/// the WebNN camelCase names. Non-ONNX names pass through unchanged.
+fn normalize_op_name(op: &str) -> &str {
+    match op {
+        "Conv" => "conv2d",
+        "MaxPool" => "maxPool2d",
+        "Transpose" => "transpose",
+        "Relu" => "relu",
+        "Add" => "add",
+        "Pad" => "pad",
+        "Concat" => "concat",
+        "Reshape" => "reshape",
+        _ => op,
+    }
+}
+
+/// Interpret a constant tensor's raw little-endian bytes as `i64` values.
+fn const_i64_values(data: &[u8]) -> Vec<i64> {
+    data.chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
 /// The name used for an operand in the exported AST (and, for constants, as the safetensors tensor
 /// key and `@weights(...)` reference). Falls back to `operand_<idx>` when the operand is unnamed.
 ///
@@ -428,8 +452,11 @@ pub fn from_graph_json(graph_json: &GraphJson) -> Result<GraphInfo, GraphError> 
 
     // Process nodes (operations)
     for node in &graph_json.nodes {
+        // Normalize ONNX-style op names to WebNN (`Conv` -> `conv2d`, etc.).
+        let op_type = normalize_op_name(&node.op);
+
         // Resolve all input names to operand indices
-        let resolved_inputs: Vec<u32> = node
+        let mut input_operands: Vec<u32> = node
             .inputs
             .iter()
             .map(|name| {
@@ -443,7 +470,86 @@ pub fn from_graph_json(graph_json: &GraphJson) -> Result<GraphInfo, GraphError> 
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let input_operands: Vec<u32> = resolved_inputs.clone();
+        // Normalize ONNX-style attributes to WebNN keys, and inline ONNX
+        // const-tensor inputs (Pad paddings, Reshape shape).
+        let mut attrs = node.options.clone();
+        match op_type {
+            "pad" => {
+                // ONNX Pad(x, paddings_const): paddings is int64[2*rank] =
+                // [begin..., end...]. Inline as beginningPadding/endingPadding.
+                if input_operands.len() >= 2 {
+                    let paddings = constant_operand_ids_to_handles
+                        .get(&input_operands[1])
+                        .map(|c| const_i64_values(&c.data))
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "webnn-graph-json".to_string(),
+                            reason: format!("Pad paddings const '{}' not found", node.inputs[1]),
+                        })?;
+                    let rank = paddings.len() / 2;
+                    let beginning: Vec<u32> = paddings[..rank].iter().map(|&v| v as u32).collect();
+                    let ending: Vec<u32> = paddings[rank..].iter().map(|&v| v as u32).collect();
+                    attrs.insert("beginningPadding".to_string(), serde_json::json!(beginning));
+                    attrs.insert("endingPadding".to_string(), serde_json::json!(ending));
+                    input_operands.truncate(1);
+                }
+            }
+            "reshape" => {
+                // ONNX Reshape(x, shape_const): inline the int64 shape as newShape.
+                if input_operands.len() >= 2 {
+                    let shape = constant_operand_ids_to_handles
+                        .get(&input_operands[1])
+                        .map(|c| const_i64_values(&c.data))
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "webnn-graph-json".to_string(),
+                            reason: format!("Reshape shape const '{}' not found", node.inputs[1]),
+                        })?;
+                    attrs.insert("newShape".to_string(), serde_json::json!(shape));
+                    input_operands.truncate(1);
+                }
+            }
+            "conv2d" => {
+                // ONNX pads = [begin_h, begin_w, end_h, end_w] -> WebNN padding =
+                // [begin_h, end_h, begin_w, end_w]. group -> groups; kernel_shape is
+                // redundant (the filter operand carries it).
+                if let Some(pads) = attrs.remove("pads") {
+                    let p: Vec<i64> = serde_json::from_value(pads).unwrap_or_default();
+                    if p.len() == 4 {
+                        attrs.insert(
+                            "padding".to_string(),
+                            serde_json::json!([p[0], p[2], p[1], p[3]]),
+                        );
+                    } else {
+                        attrs.insert("padding".to_string(), serde_json::json!(p));
+                    }
+                }
+                if let Some(g) = attrs.remove("group") {
+                    attrs.insert("groups".to_string(), g);
+                }
+                attrs.remove("kernel_shape");
+            }
+            "maxPool2d" => {
+                if let Some(k) = attrs.remove("kernel_shape") {
+                    attrs.insert("windowDimensions".to_string(), k);
+                }
+                if let Some(pads) = attrs.remove("pads") {
+                    let p: Vec<i64> = serde_json::from_value(pads).unwrap_or_default();
+                    if p.len() == 4 {
+                        attrs.insert(
+                            "padding".to_string(),
+                            serde_json::json!([p[0], p[2], p[1], p[3]]),
+                        );
+                    } else {
+                        attrs.insert("padding".to_string(), serde_json::json!(p));
+                    }
+                }
+            }
+            "transpose" => {
+                if let Some(perm) = attrs.remove("perm") {
+                    attrs.insert("permutation".to_string(), perm);
+                }
+            }
+            _ => {}
+        }
 
         // Determine output names from node.outputs or node.id
         let output_names_list: Vec<String> = if let Some(output_names) = &node.outputs {
@@ -481,14 +587,17 @@ pub fn from_graph_json(graph_json: &GraphJson) -> Result<GraphInfo, GraphError> 
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let attrs_value = serde_json::Value::Object(node.options.clone());
+        let attrs_value = serde_json::Value::Object(attrs);
         let operator = Operation::from_json_attributes(
-            &node.op,
+            op_type,
             &input_operands,
             &output_operand_ids,
             &attrs_value,
         )
-        .expect("unknown op type in JSON");
+        .ok_or_else(|| GraphError::ConversionFailed {
+            format: "webnn-graph-json".to_string(),
+            reason: format!("unsupported op type: {}", node.op),
+        })?;
 
         operations.push(operator);
     }
