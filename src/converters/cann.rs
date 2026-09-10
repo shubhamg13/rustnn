@@ -473,11 +473,12 @@ mod adapter {
     ) -> Result<ddk_CannOperatorHandle, GraphError> {
         let reshape = create_op("Reshape", name, extra_ops)?;
         connect_input(reshape, "x", x_handle)?;
+        let shape_i32: Vec<i32> = shape.iter().map(|&d| d as i32).collect();
         let shape_const = make_const(
             &format!("{name}_shape"),
-            bytemuck::cast_slice(shape),
-            &[shape.len() as i64],
-            ddk_CannDataType::CANN_DT_INT64,
+            bytemuck::cast_slice(&shape_i32),
+            &[shape_i32.len() as i64],
+            ddk_CannDataType::CANN_DT_INT32,
             2, // FORMAT_ND
         );
         extra_ops.push(shape_const);
@@ -882,6 +883,13 @@ mod adapter {
     // Returns Err if the shim library is unavailable.
     pub(crate) fn encode_via_adapter(graph: &GraphInfo) -> Result<Vec<u8>, GraphError> {
         use std::ffi::CString;
+
+        // Lower the ViT 5-D attention qkv split before emission; the HiAI NPU's
+        // Reshape/Slice/Permute kernels cap at 4-D. This is the single entry
+        // point used by both the `GraphConverter` API and the CANN backend's
+        // `build()` (the Servo/device path), so it must live here.
+        let rewritten = super::rewrite_attention_5d(graph);
+        let graph = rewritten.as_ref().unwrap_or(graph);
 
         // ── 1. Create graph ─────────────────────────────────────────────
         let graph_name = CString::new("webnn_model").unwrap();
@@ -2781,11 +2789,12 @@ mod adapter {
                     });
                 }
                 let shape_vals = descriptor_dims(&graph.operands[outputs[0] as usize].descriptor);
+                let shape_vals_i32: Vec<i32> = shape_vals.iter().map(|&d| d as i32).collect();
                 let shape_const = make_const(
                     &format!("reshape_shape_{}", outputs[0]),
-                    bytemuck::cast_slice(&shape_vals),
-                    &[shape_vals.len() as i64],
-                    ddk_CannDataType::CANN_DT_INT64,
+                    bytemuck::cast_slice(&shape_vals_i32),
+                    &[shape_vals_i32.len() as i64],
+                    ddk_CannDataType::CANN_DT_INT32,
                     2, // FORMAT_ND
                 );
                 extra_ops.push(shape_const);
@@ -3333,6 +3342,269 @@ pub(crate) fn encode_via_adapter(_graph: &GraphInfo) -> Result<Vec<u8>, GraphErr
     })
 }
 
+/// Rewrites the ViT multi-head-attention qkv split into a ≤4-D form the HiAI
+/// NPU's Reshape/Slice/Permute kernels accept (they reject 5-D ND tensors).
+/// Shape-driven (no op-name matching), so it applies to any transformer using
+/// the `[B,N,3,H,D]` qkv layout.
+///
+/// Pattern:
+///   Reshape(qkv → [B,N,3,H,D]) → Transpose([2,0,3,1,4]) → Slice(axis0)×3 → Reshape([B,H,N,D])×3
+/// Rewrite (numerically identical):
+///   Slice(qkv, axis2, [0,0,α·C], [B,N,C])×3 → Reshape([B,N,H,D])×3 → Transpose([0,2,1,3])×3
+///
+/// Returns `Some(rewritten)` when at least one block matched, else `None`.
+fn rewrite_attention_5d(graph: &GraphInfo) -> Option<GraphInfo> {
+    use crate::graph::{Dimension, Operand, OperandDescriptor, OperandKind};
+    use crate::operator_options::{MLDimension, MLTransposeOptions};
+
+    let mut g = graph.clone();
+    let orig_ops = g.operations.clone();
+    let orig_operands = g.operands.clone();
+
+    let mut remove = vec![false; orig_ops.len()];
+    // Consumer-reshape index -> the new ≤4-D transpose output feeding it.
+    let mut rewire_input: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    // Anchor op index (the 5-D reshape) -> replacement ops to insert there, so
+    // the new producers precede the kept consumer reshapes (topological order).
+    let mut inserts: std::collections::HashMap<usize, Vec<Operation>> =
+        std::collections::HashMap::new();
+    let mut new_operands: Vec<Operand> = Vec::new();
+    let mut blocks = 0usize;
+
+    for (ri, rop) in orig_ops.iter().enumerate() {
+        // 1. The rank-5 reshape whose qkv axis (dim 2) is 3.
+        let (qkv, dims5, r5_out) = match rop {
+            Operation::Reshape {
+                input,
+                new_shape,
+                outputs,
+                ..
+            } if new_shape.len() == 5 && outputs.len() == 1 => {
+                let dims: Option<Vec<u32>> = new_shape
+                    .iter()
+                    .map(|d| match d {
+                        MLDimension::Static(v) => Some(*v),
+                        MLDimension::Dynamic(_) => None,
+                    })
+                    .collect();
+                match dims {
+                    Some(d) if d[2] == 3 => (*input, d, outputs[0]),
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        let (b, n, h, d) = (dims5[0], dims5[1], dims5[3], dims5[4]);
+        let c = h * d;
+
+        // 2. The 5-D transpose moving the qkv axis to the front.
+        let mut t_found = None;
+        for (i, op) in orig_ops.iter().enumerate() {
+            let Operation::Transpose {
+                input,
+                options,
+                outputs,
+                ..
+            } = op
+            else {
+                continue;
+            };
+            if *input != r5_out {
+                continue;
+            }
+            let perm = options
+                .as_ref()
+                .map(|o| o.permutation.clone())
+                .unwrap_or_default();
+            if perm == [2, 0, 3, 1, 4] {
+                t_found = Some((i, outputs[0]));
+                break;
+            }
+        }
+        let (ti, t_out) = match t_found {
+            Some(x) => x,
+            None => continue,
+        };
+
+        // 3. Exactly three axis-0 slices consume the transpose, each feeding a
+        // reshape back (any rank — the query in ViT flattens the batch dim, so
+        // its reshape is rank-3, e.g. [H,N,D], while k/v are rank-4).
+        let mut all_slice_indices: Vec<usize> = Vec::new();
+        let mut slices: Vec<(usize, u32, usize, u32)> = Vec::new();
+        for (si, op) in orig_ops.iter().enumerate() {
+            if let Operation::Slice {
+                input,
+                starts,
+                sizes,
+                options,
+                outputs,
+                ..
+            } = op
+            {
+                if *input != t_out || starts.len() != 5 || sizes.len() != 5 || outputs.len() != 1 {
+                    continue;
+                }
+                if options
+                    .as_ref()
+                    .is_some_and(|o| o.strides.iter().any(|&s| s != 1))
+                {
+                    continue;
+                }
+                all_slice_indices.push(si);
+                let s_out = outputs[0];
+                for (rri, rop2) in orig_ops.iter().enumerate() {
+                    let Operation::Reshape { input, outputs, .. } = rop2 else {
+                        continue;
+                    };
+                    if *input == s_out && outputs.len() == 1 {
+                        slices.push((si, starts[0], rri, outputs[0]));
+                        break;
+                    }
+                }
+            }
+        }
+        if all_slice_indices.len() != 3 || slices.len() != 3 {
+            continue;
+        }
+        let mut alphas: Vec<u32> = slices.iter().map(|s| s.1).collect();
+        alphas.sort_unstable();
+        if alphas != [0, 1, 2] {
+            continue;
+        }
+
+        // Mark the 5-D reshape, the 5-D transpose, and the 3 slices for removal.
+        // The 3 consumer reshapes are kept (their output shapes — rank-3 for q,
+        // rank-4 for k/v — are preserved); only their input is rewired below.
+        remove[ri] = true;
+        remove[ti] = true;
+        for &si in &all_slice_indices {
+            remove[si] = true;
+        }
+
+        // Emit the ≤4-D replacement per slice, ending in a [B,H,N,D] tensor that
+        // feeds the (kept) consumer reshape.
+        let dtype = orig_operands[qkv as usize].descriptor.data_type;
+        let mut block_ops: Vec<Operation> = Vec::with_capacity(slices.len() * 3);
+        for &(_, alpha, rri, _) in &slices {
+            let s_id = (orig_operands.len() + new_operands.len()) as u32;
+            new_operands.push(Operand {
+                kind: OperandKind::Intermediate,
+                descriptor: OperandDescriptor {
+                    data_type: dtype,
+                    shape: vec![
+                        Dimension::Static(b),
+                        Dimension::Static(n),
+                        Dimension::Static(c),
+                    ],
+                    pending_permutation: vec![],
+                },
+                name: None,
+            });
+            let r_id = (orig_operands.len() + new_operands.len()) as u32;
+            new_operands.push(Operand {
+                kind: OperandKind::Intermediate,
+                descriptor: OperandDescriptor {
+                    data_type: dtype,
+                    shape: vec![
+                        Dimension::Static(b),
+                        Dimension::Static(n),
+                        Dimension::Static(h),
+                        Dimension::Static(d),
+                    ],
+                    pending_permutation: vec![],
+                },
+                name: None,
+            });
+            let t_id = (orig_operands.len() + new_operands.len()) as u32;
+            new_operands.push(Operand {
+                kind: OperandKind::Intermediate,
+                descriptor: OperandDescriptor {
+                    data_type: dtype,
+                    shape: vec![
+                        Dimension::Static(b),
+                        Dimension::Static(h),
+                        Dimension::Static(n),
+                        Dimension::Static(d),
+                    ],
+                    pending_permutation: vec![],
+                },
+                name: None,
+            });
+            block_ops.push(Operation::Slice {
+                input: qkv,
+                starts: vec![0, 0, alpha * c],
+                sizes: vec![
+                    MLDimension::Static(b),
+                    MLDimension::Static(n),
+                    MLDimension::Static(c),
+                ],
+                options: None,
+                outputs: vec![s_id],
+            });
+            block_ops.push(Operation::Reshape {
+                input: s_id,
+                new_shape: vec![
+                    MLDimension::Static(b),
+                    MLDimension::Static(n),
+                    MLDimension::Static(h),
+                    MLDimension::Static(d),
+                ],
+                options: None,
+                outputs: vec![r_id],
+            });
+            block_ops.push(Operation::Transpose {
+                input: r_id,
+                options: Some(MLTransposeOptions {
+                    label: String::new(),
+                    permutation: vec![0, 2, 1, 3],
+                }),
+                outputs: vec![t_id],
+            });
+            rewire_input.insert(rri, t_id);
+        }
+        inserts.insert(ri, block_ops);
+        blocks += 1;
+    }
+
+    if blocks == 0 {
+        return None;
+    }
+    log::error!("[cann-rewrite] attention_5d blocks={blocks}");
+
+    let mut ops: Vec<Operation> = Vec::with_capacity(orig_ops.len() + new_operands.len());
+    for (i, op) in orig_ops.into_iter().enumerate() {
+        // Insert each block's replacement ops where its 5-D reshape was, so the
+        // new producers precede the (kept) consumer reshapes.
+        if let Some(block_ops) = inserts.remove(&i) {
+            ops.extend(block_ops);
+        }
+        if remove[i] {
+            continue;
+        }
+        match rewire_input.get(&i) {
+            Some(&new_input) => match op {
+                Operation::Reshape {
+                    new_shape,
+                    options,
+                    outputs,
+                    ..
+                } => ops.push(Operation::Reshape {
+                    input: new_input,
+                    new_shape,
+                    options,
+                    outputs,
+                }),
+                other => ops.push(other),
+            },
+            None => ops.push(op),
+        }
+    }
+    g.operations = ops;
+    g.operands.extend(new_operands);
+
+    Some(g)
+}
+
 pub struct CannConverter;
 
 impl GraphConverter for CannConverter {
@@ -3341,7 +3613,7 @@ impl GraphConverter for CannConverter {
     }
 
     fn convert(&self, graph: &GraphInfo) -> Result<ConvertedGraph, GraphError> {
-        // Call CANN shim layer.
+        // Call CANN shim layer (which itself lowers the ViT 5-D attention).
         if let Ok(bytes) = encode_via_adapter(graph) {
             return Ok(ConvertedGraph {
                 format: "cann",
@@ -3620,5 +3892,296 @@ mod tests {
             outputs: vec![1],
         };
         assert_eq!(webnn_op_to_hiai(&op), None);
+    }
+
+    // ── 5-D attention rewrite ─────────────────────────────────────────
+
+    /// A minimal ViT qkv split: qkv[1,4,12] → reshape[1,4,3,2,2] →
+    /// transpose[2,0,3,1,4] → slice(axis0)×3 → reshape[1,2,4,2]×3.
+    /// H=2, D=2 ⇒ C=4.
+    fn make_attention_5d_graph() -> GraphInfo {
+        use crate::operator_options::MLTransposeOptions;
+
+        let mk = |kind, shape: &[u32], name: Option<&str>| Operand {
+            kind,
+            descriptor: OperandDescriptor {
+                data_type: DataType::Float32,
+                shape: shape.iter().map(|&d| Dimension::Static(d)).collect(),
+                pending_permutation: vec![],
+            },
+            name: name.map(|s| s.to_string()),
+        };
+        let dims = |s: &[u32]| {
+            s.iter()
+                .map(|&d| MLDimension::Static(d))
+                .collect::<Vec<_>>()
+        };
+        let slice = |out: u32, alpha: u32| Operation::Slice {
+            input: 2,
+            starts: vec![alpha, 0, 0, 0, 0],
+            sizes: dims(&[1, 1, 2, 4, 2]),
+            options: None,
+            outputs: vec![out],
+        };
+
+        GraphInfo {
+            operands: vec![
+                mk(OperandKind::Input, &[1, 4, 12], Some("qkv")), // 0
+                mk(OperandKind::Intermediate, &[1, 4, 3, 2, 2], None), // 1 r5
+                mk(OperandKind::Intermediate, &[3, 1, 2, 4, 2], None), // 2 t5
+                mk(OperandKind::Intermediate, &[1, 1, 2, 4, 2], None), // 3 q5
+                mk(OperandKind::Intermediate, &[1, 1, 2, 4, 2], None), // 4 k5
+                mk(OperandKind::Intermediate, &[1, 1, 2, 4, 2], None), // 5 v5
+                // The query (α=2) flattens the batch dim → rank-3 [H,N,D];
+                // key/value keep rank-4 [B,H,N,D].
+                mk(OperandKind::Output, &[2, 4, 2], Some("q")), // 6
+                mk(OperandKind::Output, &[1, 2, 4, 2], Some("k")), // 7
+                mk(OperandKind::Output, &[1, 2, 4, 2], Some("v")), // 8
+            ],
+            input_operands: vec![0],
+            output_operands: vec![6, 7, 8],
+            operations: vec![
+                Operation::Reshape {
+                    input: 0,
+                    new_shape: dims(&[1, 4, 3, 2, 2]),
+                    options: None,
+                    outputs: vec![1],
+                },
+                Operation::Transpose {
+                    input: 1,
+                    options: Some(MLTransposeOptions {
+                        label: String::new(),
+                        permutation: vec![2, 0, 3, 1, 4],
+                    }),
+                    outputs: vec![2],
+                },
+                slice(3, 2),
+                Operation::Reshape {
+                    input: 3,
+                    new_shape: dims(&[2, 4, 2]),
+                    options: None,
+                    outputs: vec![6],
+                },
+                slice(4, 1),
+                Operation::Reshape {
+                    input: 4,
+                    new_shape: dims(&[1, 2, 4, 2]),
+                    options: None,
+                    outputs: vec![7],
+                },
+                slice(5, 0),
+                Operation::Reshape {
+                    input: 5,
+                    new_shape: dims(&[1, 2, 4, 2]),
+                    options: None,
+                    outputs: vec![8],
+                },
+            ],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        }
+    }
+
+    #[test]
+    fn test_rewrite_attention_5d_transforms() {
+        let graph = make_attention_5d_graph();
+        let rewritten = rewrite_attention_5d(&graph).expect("pattern should be detected");
+        assert_valid_graph(&rewritten);
+
+        // No 5-D reshape/slice/transpose remains.
+        assert!(rewritten.operations.iter().all(|op| match op {
+            Operation::Reshape { new_shape, .. } => new_shape.len() != 5,
+            Operation::Slice { starts, .. } => starts.len() != 5,
+            Operation::Transpose { options, .. } =>
+                options.as_ref().map(|o| o.permutation.len()).unwrap_or(0) != 5,
+            _ => true,
+        }));
+
+        // Exactly 3 new slices of qkv (axis 2), starts {0,4,8}, size [1,4,4].
+        let slices: Vec<(u32, Vec<u32>, Vec<MLDimension>)> = rewritten
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Slice {
+                    input,
+                    starts,
+                    sizes,
+                    ..
+                } => Some((*input, starts.clone(), sizes.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slices.len(), 3);
+        for (input, starts, sizes) in &slices {
+            assert_eq!(*input, 0);
+            assert_eq!(starts.len(), 3);
+            assert_eq!(
+                sizes.iter().map(|d| d.static_or_max()).collect::<Vec<_>>(),
+                vec![1, 4, 4]
+            );
+        }
+        let mut slice_starts: Vec<u32> = slices.iter().map(|(_, s, _)| s[2]).collect();
+        slice_starts.sort_unstable();
+        assert_eq!(slice_starts, vec![0, 4, 8]);
+
+        // Three new 4-D transposes perm [0,2,1,3] feed the (kept) q/k/v reshapes.
+        let transposes: Vec<Vec<u32>> = rewritten
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Transpose { options, .. } => Some(
+                    options
+                        .as_ref()
+                        .map(|o| o.permutation.clone())
+                        .unwrap_or_default(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transposes.len(), 3);
+        for perm in &transposes {
+            assert_eq!(perm, &vec![0, 2, 1, 3]);
+        }
+
+        // q/k/v output operands keep their original shapes (q rank-3, k/v rank-4).
+        assert_eq!(
+            rewritten.operands[6].descriptor.shape,
+            vec![
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(2)
+            ]
+        );
+        assert_eq!(
+            rewritten.operands[7].descriptor.shape,
+            vec![
+                Dimension::Static(1),
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(2)
+            ]
+        );
+        assert_eq!(
+            rewritten.operands[8].descriptor.shape,
+            vec![
+                Dimension::Static(1),
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Static(2)
+            ]
+        );
+
+        // Topological order: each new transpose (producer of a t_id) precedes the
+        // kept consumer reshape that reads it (no forward reference).
+        for (op_idx, op) in rewritten.operations.iter().enumerate() {
+            let Operation::Reshape { input, outputs, .. } = op else {
+                continue;
+            };
+            if ![6u32, 7, 8].contains(&outputs[0]) {
+                continue;
+            }
+            let producer_idx = rewritten
+                .operations
+                .iter()
+                .position(
+                    |o| matches!(o, Operation::Transpose { outputs, .. } if outputs[0] == *input),
+                )
+                .unwrap_or_else(|| panic!("reshape {input} input is not a transpose output"));
+            assert!(
+                producer_idx < op_idx,
+                "transpose must precede its consumer reshape"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_attention_5d_noop_when_absent() {
+        let graph = GraphInfo {
+            operands: vec![
+                Operand {
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![Dimension::Static(2), Dimension::Static(2)],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("x".to_string()),
+                },
+                Operand {
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: vec![Dimension::Static(4)],
+                        pending_permutation: vec![],
+                    },
+                    name: Some("y".to_string()),
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![Operation::Reshape {
+                input: 0,
+                new_shape: vec![MLDimension::Static(4)],
+                options: None,
+                outputs: vec![1],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        };
+        assert!(rewrite_attention_5d(&graph).is_none());
+    }
+
+    /// Single-input operand id for the ops used by this module's rewrite.
+    fn op_input(op: &Operation) -> Option<u32> {
+        match op {
+            Operation::Reshape { input, .. }
+            | Operation::Slice { input, .. }
+            | Operation::Transpose { input, .. } => Some(*input),
+            _ => None,
+        }
+    }
+
+    /// Output operand ids for the ops used by this module's rewrite.
+    fn op_outputs(op: &Operation) -> &[u32] {
+        match op {
+            Operation::Reshape { outputs, .. }
+            | Operation::Slice { outputs, .. }
+            | Operation::Transpose { outputs, .. } => outputs,
+            _ => &[],
+        }
+    }
+
+    /// Structural sanity: every referenced operand is in-range, every non-input
+    /// operand is produced exactly once, and every input is produced before use.
+    fn assert_valid_graph(g: &GraphInfo) {
+        let mut producer = std::collections::HashMap::new();
+        for (idx, op) in g.operations.iter().enumerate() {
+            for &out in op_outputs(op) {
+                assert!(
+                    (out as usize) < g.operands.len(),
+                    "output {out} out of range"
+                );
+                assert!(
+                    producer.insert(out, idx).is_none(),
+                    "operand {out} produced twice"
+                );
+            }
+        }
+        for (idx, op) in g.operations.iter().enumerate() {
+            if let Some(inp) = op_input(op) {
+                assert!(
+                    (inp as usize) < g.operands.len(),
+                    "input {inp} out of range"
+                );
+                if let Some(&p) = producer.get(&inp) {
+                    assert!(
+                        p < idx,
+                        "operand {inp} (produced at {p}) used before production at {idx}"
+                    );
+                }
+            }
+        }
     }
 }

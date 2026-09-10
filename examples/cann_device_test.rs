@@ -94,6 +94,28 @@ fn main() {
     assert_eq!(out_data, [6.0f32, 8.0, 10.0, 12.0]);
     println!("  PASS");
 
+    // Re-dispatch the same graph with different inputs: verifies the input
+    // buffer is re-read every dispatch (matters for the zero-copy input path,
+    // which references the caller's buffer rather than snapshotting it).
+    context
+        .write_tensor(&tensor_a, &vec![10.0f32, 20.0, 30.0, 40.0])
+        .unwrap();
+    context
+        .write_tensor(&tensor_b, &vec![1.0f32, 1.0, 1.0, 1.0])
+        .unwrap();
+    context
+        .dispatch(
+            &mut graph,
+            &BTreeMap::from([("a", &tensor_a), ("b", &tensor_b)]),
+            &BTreeMap::from([("sum", &tensor_out)]),
+        )
+        .unwrap();
+    let mut out_data2 = vec![0.0f32; 4];
+    context.read_tensor(&tensor_out, &mut out_data2).unwrap();
+    println!("  Add([10,20,30,40], [1,1,1,1]) = {:?}", out_data2);
+    assert_eq!(out_data2, [11.0f32, 21.0, 31.0, 41.0]);
+    println!("  PASS (re-dispatch)");
+
     // ── Test 2: Sub ─────────────────────────────────────────────────
     println!("\n--- Op: Sub ---");
 
@@ -919,4 +941,30 @@ fn main() {
     println!("  PASS");
 
     println!("\n=== All tests passed ===");
+
+    // ── Memcpy micro-benchmark ─────────────────────────────────────────
+    // Establishes the on-device memcpy rate for buffers the size of the demo's
+    // I/O tensors (~1.6 MB input / ~2.6 MB output), to tell whether the ~1.4-2.4
+    // GB/s observed in the marshal/readback is normal cold-streaming or an
+    // artifact. Prints MB/s for cold and warm 2.6 MB copies.
+    println!("\n--- Memcpy micro-benchmark (2.6 MB) ---");
+    const N: usize = 2_600_000;
+    for (label, warm) in [("cold src", false), ("warm src", true)] {
+        let src = vec![0xAAu8; N];
+        let mut dst = vec![0u8; N];
+        if warm {
+            // Touch the source so it is cache-resident before timing.
+            let mut acc = 0u64;
+            for &b in &src {
+                acc = acc.wrapping_add(b as u64);
+            }
+            std::hint::black_box(acc);
+        }
+        let t0 = std::time::Instant::now();
+        dst.copy_from_slice(&src);
+        let dt = t0.elapsed().as_secs_f64();
+        let mbs = (N as f64) / (dt * 1e6);
+        println!("  {label}: {:.2} ms ({:.2} MB/s)", dt * 1e3, mbs);
+        std::hint::black_box(&dst);
+    }
 }
