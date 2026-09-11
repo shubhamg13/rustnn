@@ -98,12 +98,7 @@ fn push_backend_trials(
                 }
                 Err(err) => {
                     let msg = err.message().unwrap_or("test failed");
-                    if backend_prefix != "coreml" {
-                        insta::assert_snapshot!(
-                            snapshot_name,
-                            format!("{file_name} {test_name}, {backend_prefix}\n {msg}")
-                        );
-                    }
+                    // Failures are tracked in {backend}_expected_failures.txt.
                     report.record_fail(&file_name, &test_name, &backend_prefix, msg, duration);
                 }
             }
