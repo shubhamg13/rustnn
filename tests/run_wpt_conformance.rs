@@ -84,7 +84,7 @@ fn push_backend_trials(
 
             match &result {
                 Ok(Completion::Completed) => {
-                    if backend_prefix != "coreml" {
+                    if backend_prefix != "coreml" && backend_prefix != "cann" {
                         insta::assert_debug_snapshot!(
                             snapshot_name,
                             (&file_name, &test_name, &backend_prefix, "PASS")
@@ -98,7 +98,7 @@ fn push_backend_trials(
                 }
                 Err(err) => {
                     let msg = err.message().unwrap_or("test failed");
-                    if backend_prefix != "coreml" {
+                    if backend_prefix != "coreml" && backend_prefix != "cann" {
                         insta::assert_snapshot!(
                             snapshot_name,
                             format!("{file_name} {test_name}, {backend_prefix}\n {msg}")

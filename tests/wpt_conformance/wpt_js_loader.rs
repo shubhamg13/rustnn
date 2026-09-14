@@ -2,6 +2,7 @@
 //!
 //! Mirrors pywebnn/tests/wpt_js_loader.py: one Node process dumps the full corpus.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -91,6 +92,18 @@ pub fn ensure_wpt_cache(wpt_dir: &Path) -> Result<(), String> {
 
 /// Load the full WPT conformance corpus in one Node.js invocation.
 pub fn load_wpt_corpus(wpt_dir: &Path) -> Result<WptCorpus, String> {
+    // On-device runs (e.g. CANN) have no Node.js; load a pre-dumped corpus JSON
+    // from the host instead of spawning the Node bridge.
+    if let Ok(path) = std::env::var("WPT_CORPUS_JSON")
+        && !path.is_empty()
+    {
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read WPT_CORPUS_JSON {path}: {e}"))?;
+        let corpus: WptCorpus = serde_json::from_str(&text)
+            .map_err(|e| format!("invalid WPT corpus JSON in {path}: {e}"))?;
+        return Ok(corpus);
+    }
+
     ensure_wpt_cache(wpt_dir)?;
 
     let script = dump_corpus_script();

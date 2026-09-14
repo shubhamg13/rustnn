@@ -82,7 +82,7 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 	CANN_DDK=$(CANN_DDK) \
 	RUSTFLAGS="-Clink-arg=--target=aarch64-linux-ohos -Clink-arg=--sysroot=$(OHOS_SDK_NATIVE)/sysroot"
 
-.PHONY: build test fmt run viz onnx coreml coreml-validate onnx-validate litert cann cann-build cann-device-test validate-cann-env validate-all-env \
+.PHONY: build test fmt run viz onnx coreml coreml-validate onnx-validate litert cann cann-build cann-device-test test-wpt-cann validate-cann-env validate-all-env \
 	docs-serve docs-build docs-clean ci-docs docs-backend-ops docs-backend-ops-check \
 	fmt-check lint \
 	coverage coverage-html coverage-lcov coverage-open coverage-clean \
@@ -296,6 +296,16 @@ cann-device-test: validate-cann-env
 	CANN_DDK=$(CANN_DDK) \
 	./scripts/ohos-test-helper.sh $(filter-out $@,$(MAKECMDGOALS))
 
+test-wpt-cann: fetch-wpt
+	@if [ -z "$(CANN_DDK)" ]; then \
+	    echo "Error: CANN_DDK not set. export CANN_DDK=/path/to/CANN-Kit-next/ddk/"; \
+	    exit 1; \
+	fi
+	$(CANN_CROSS_ENV) $(CARGO) test --test run_wpt_conformance --no-run \
+		--target aarch64-unknown-linux-ohos --features cann-runtime --release
+	CANN_DDK=$(CANN_DDK) \
+	./scripts/ohos-test-helper.sh wpt $(filter-out $@,$(MAKECMDGOALS))
+
 validate-all-env: build test onnx-validate coreml-validate
 	@echo "Full pipeline (build/test/convert/validate) completed."
 
@@ -392,6 +402,7 @@ help:
 	@echo "  cann               - Convert graph to CANN/HiAI format"
 	@echo "  cann-build    		- Cross-compile rustnn for OHOS via cargo"
 	@echo "  cann-device-test   - Test on device via scripts/ohos-test-helper.sh"
+	@echo "  test-wpt-cann      - Run WPT conformance suite via CANN on device"
 	@echo ""
 	@echo "Documentation:"
 	@echo "  docs-serve         - Serve documentation with live reload"
