@@ -90,9 +90,6 @@ pub(crate) fn webnn_op_to_hiai(op: &Operation) -> Option<&'static str> {
 
         // ── Convolution + Pool + Matmul ──────────────────────────────
         Operation::Conv2d { .. } => Some("Conv2D"),
-        // ConvTranspose2d is decomposed into a Convolution (stride=1 +
-        // recomputed pads); native hiai::op::ConvTranspose is unsupported on
-        // the NPU.
         Operation::ConvTranspose2d { .. } => Some("Conv2D"),
         Operation::MaxPool2d { .. } => Some("MaxPool"),
         Operation::AveragePool2d { .. } => Some("AvgPool"),
@@ -154,9 +151,6 @@ pub(crate) fn webnn_op_to_hiai(op: &Operation) -> Option<&'static str> {
         Operation::Reverse { .. } => None,
 
         // ── Not supported ─────────────────────────────────────────────
-        // `constant`/`shape` are produced as data rather than ops, and the
-        // wrong-semantics gather/scatter and incomplete normalization/
-        // quantization variants have no correct hiai op.
         Operation::Constant { .. }
         | Operation::Shape { .. }
         | Operation::GatherElements { .. }
