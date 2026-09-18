@@ -89,7 +89,8 @@ CANN_CROSS_ENV = CC_aarch64_unknown_linux_ohos=$(OHOS_SDK_NATIVE)/llvm/bin/clang
 	test-wpt-coreml-report test-wpt-op test-wpt-report \
 	wpt-sync-onnx wpt-sync-litert wpt-sync-coreml wpt-sync-trtx \
 	webnn-chromedriver test-webnn-wpt-chrome test-webnn-wpt-chrome-headless \
-	onnxruntime-download onnx onnx-validate coreml coreml-validate litert cann validate-all-env
+	onnxruntime-download onnx onnx-validate coreml coreml-validate litert cann \
+	cann-build cann-device-test validate-cann-env validate-all-env
 
 clean:
 	$(CARGO) clean
