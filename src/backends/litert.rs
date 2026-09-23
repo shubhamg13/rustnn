@@ -76,6 +76,18 @@ pub(crate) struct LiteRtGraph {
     filter_transpose_info: std::collections::HashMap<String, (String, Vec<i32>, bool)>,
     /// Output operand names needing BOOL type (WHERE condition, comparison ops).
     bool_operand_names: std::collections::HashSet<String>,
+    /// Graph input names in the order the model's signature declares them.
+    ///
+    /// LiteRT binds the buffers passed to `LiteRtRunCompiledModel` to signature
+    /// slots positionally, so this must not be derived from the caller's
+    /// `MLNamedTensors`: that is a `BTreeMap` and iterates alphabetically, which
+    /// silently swaps the slots whenever a graph has two or more inputs (e.g. a
+    /// conv2d whose filter is an input rather than a constant). Swapping slots
+    /// makes the registered buffer shape disagree with the tensor it is bound
+    /// to, and LiteRT then fails with `kLiteRtStatusErrorRuntimeFailure`.
+    input_order: Vec<String>,
+    /// Graph output names in the order the model's signature declares them.
+    output_order: Vec<String>,
 }
 
 unsafe impl Send for LiteRtGraph {}
@@ -88,6 +100,8 @@ impl LiteRtGraph {
         spatial_operand_names: std::collections::HashSet<String>,
         filter_transpose_info: std::collections::HashMap<String, (String, Vec<i32>, bool)>,
         bool_operand_names: std::collections::HashSet<String>,
+        input_order: Vec<String>,
+        output_order: Vec<String>,
     ) -> Result<Self> {
         let owned = model_bytes.into_boxed_slice();
         unsafe {
@@ -128,6 +142,8 @@ impl LiteRtGraph {
                 spatial_operand_names,
                 filter_transpose_info,
                 bool_operand_names,
+                input_order,
+                output_order,
             })
         }
     }
@@ -693,6 +709,35 @@ fn ohwi_shape_from_layout(shape: &[i32], layout: &str) -> Vec<i32> {
     }
 }
 
+/// Orders `names` to match the model's signature order.
+///
+/// `MLNamedTensors` is a `BTreeMap` and therefore iterates alphabetically, but
+/// LiteRT binds the buffers passed to `LiteRtRunCompiledModel` to signature
+/// slots positionally. Building the buffer list alphabetically swaps the slots
+/// for any graph whose names do not happen to sort into declaration order (e.g.
+/// a conv2d whose filter is a graph input named `f` alongside an input named
+/// `x`), and the resulting shape/tensor disagreement makes LiteRT fail with
+/// `kLiteRtStatusErrorRuntimeFailure`.
+fn order_by_signature<'a>(
+    order: &'a [String],
+    names: &'a MLNamedTensors<'a>,
+) -> Vec<(&'a str, &'a MLTensor)> {
+    let mut ordered: Vec<(&'a str, &'a MLTensor)> = order
+        .iter()
+        .filter_map(|name| names.get(name.as_str()).map(|t| (name.as_str(), *t)))
+        .collect();
+    // Anything bound but not declared by the signature is unexpected; keep it so
+    // the mismatch surfaces downstream rather than silently shortening the list.
+    if ordered.len() != names.len() {
+        for (name, tensor) in names {
+            if !order.iter().any(|declared| declared == *name) {
+                ordered.push((name, *tensor));
+            }
+        }
+    }
+    ordered
+}
+
 fn build_input_handles(
     sorted_inputs: &[(&str, &MLTensor)],
     tensors: &mut [LiteRtTensor],
@@ -947,13 +992,10 @@ impl<'context> MLBackendContext<'context> for LiteRtContext {
             }
         };
 
-        let mut sorted_inputs: Vec<(&str, &MLTensor)> =
-            inputs.iter().map(|(k, v)| (*k, *v)).collect();
-        sorted_inputs.sort_by_key(|(name, _)| *name);
-
-        let mut sorted_outputs: Vec<(&str, &MLTensor)> =
-            outputs.iter().map(|(k, v)| (*k, *v)).collect();
-        sorted_outputs.sort_by_key(|(name, _)| *name);
+        // Order by the model's signature, not alphabetically — LiteRT binds
+        // these buffers to signature slots positionally.
+        let sorted_inputs = order_by_signature(&lite_graph.input_order, inputs);
+        let sorted_outputs = order_by_signature(&lite_graph.output_order, outputs);
 
         let (in_raw, _temp_in_tensors) = build_input_handles(
             &sorted_inputs,
@@ -999,6 +1041,17 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for LiteRtBuilder 
         let (input_descriptors, output_descriptors) = graph_info
             .io_binding_maps()
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        // Capture the signature order before the graph is rewritten: the model
+        // binds buffers positionally, and `io_binding_maps` returns unordered
+        // maps, so this is the only record of the order LiteRT will expect.
+        let operand_order = |ids: &[u32]| -> Vec<String> {
+            ids.iter()
+                .filter_map(|&id| graph_info.operand(id).and_then(|o| o.name.clone()))
+                .collect()
+        };
+        let input_order = operand_order(&graph_info.input_operands);
+        let output_order = operand_order(&graph_info.output_operands);
+
         let (spatial_operand_names, filter_transpose_info) = collect_spatial_info(&graph_info);
         let mut graph_info = graph_info;
         modify_graph_for_nhwc(&mut graph_info, &spatial_operand_names);
@@ -1011,6 +1064,8 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for LiteRtBuilder 
             spatial_operand_names,
             filter_transpose_info,
             bool_operand_names,
+            input_order,
+            output_order,
         )
         .map_err(|e| Error::GraphBuildError {
             source: format!("failed to compile model: {e}").into(),
