@@ -71,6 +71,13 @@ if ! grep -q -F '[WPT] result:' "$WPT_LOG"; then
     exit 1
 fi
 
+# ---- Record the totals for the sync commit message ----
+
+SUMMARY="/tmp/wpt_${BACKEND}_summary.txt"
+result_line=$(sed -nE 's/^\[WPT\] result: //; s/;.*$//p' "$WPT_LOG" | head -1)
+printf '%s: %s\n' "$BACKEND" "$result_line" > "$SUMMARY"
+echo "pass totals: $(cat "$SUMMARY")"
+
 # ---- Extract failures from log ----
 
 sed -nE "s/^[[:space:]]{4,}(${BACKEND}::[^[:space:]]+).*/\1/p" "$WPT_LOG" | LC_ALL=C sort -u > "$FAILURES"
