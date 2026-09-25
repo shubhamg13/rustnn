@@ -74,7 +74,7 @@ fi
 # ---- Record the totals for the sync commit message ----
 
 SUMMARY="/tmp/wpt_${BACKEND}_summary.txt"
-result_line=$(grep -m1 -F '[WPT] result:' "$WPT_LOG" | sed -E 's/^\[WPT\] result: //; s/;.*//')
+result_line=$(sed -nE 's/^\[WPT\] result: //; s/;.*$//p' "$WPT_LOG" | head -1)
 printf '%s: %s\n' "$BACKEND" "$result_line" > "$SUMMARY"
 echo "pass totals: $(cat "$SUMMARY")"
 
